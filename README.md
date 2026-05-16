@@ -153,16 +153,36 @@ Claude: [calls read_recent_messages] → digest of the last ~20 messages
 
 ### Tools the MCP exposes
 
-- `send_message(text)` — text to your Telegram
-- `send_photo(url, caption?)` — photo from a public URL
-- `send_audio(url, caption?, title?, performer?)` — MP3/M4A from URL
-- `send_document(url, caption?, filename?)` — any file ≤50 MB from URL
-- `send_typing()` — "typing…" indicator
-- `read_recent_messages(limit=20)` — last N messages you sent the bot (24h)
+Two flavors. **URL-based** tools take a public https URL (Telegram fetches the
+file server-side — the file never touches your Railway service). **Data-based**
+tools take base64-encoded bytes (the file passes through MCP → Railway →
+Telegram; capped at 20 MB).
 
-For `send_audio` / `send_photo` / `send_document` Telegram fetches the URL
-server-side — the URL must be publicly reachable, but the file doesn't pass
-through your Railway service.
+| Tool | When to use it |
+| --- | --- |
+| `send_message(text)` | Plain text. |
+| `send_typing()` | "typing…" indicator. |
+| `send_photo(url, caption?)` | Photo already hosted at a public URL. |
+| `send_audio(url, caption?, title?, performer?)` | MP3/M4A at a public URL. |
+| `send_document(url, caption?, filename?)` | Any file ≤50 MB at a public URL. |
+| `send_photo_data(filename, content_base64, caption?)` | Local image file. |
+| `send_audio_data(filename, content_base64, caption?, title?, performer?)` | Local audio file. |
+| `send_document_data(filename, content_base64, caption?)` | Any local file ≤20 MB. |
+| `read_recent_messages(limit=20)` | Last N messages you sent the bot (24h). |
+
+### Sending a file from your computer
+
+You have two routes for local files:
+
+1. **Keep the file in your Cowork-mounted folder** (default
+   `~/Documents/Claude/Projects/Telegram/`). Then just ask Claude:
+   *"Send `song.mp3` from the folder to my Telegram."* Claude reads the file
+   with its `Read` tool, base64-encodes it, and calls `send_audio_data`.
+2. **Drag the file into the Cowork chat input.** Same flow — it lands in the
+   sandbox's `uploads/` directory which Claude can read.
+
+For files >20 MB, upload them to any public host (Dropbox public link, GitHub
+release, S3 with a public ACL, etc.) and use the URL-based variants instead.
 
 ## 5. Optional: persistent SQLite across deploys
 

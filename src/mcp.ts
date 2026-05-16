@@ -54,6 +54,94 @@ async function callTelegram(method: string, payload: Record<string, unknown>) {
   return data.result;
 }
 
+// ---------------------------------------------------------------------------
+// Direct file uploads — for files that exist only on the client (e.g. on the
+// user's laptop, or in Cowork's sandbox). Claude reads the file, base64-
+// encodes it, passes the bytes through MCP; we decode here and ship to
+// Telegram as multipart/form-data. No URL, no public hosting needed.
+// ---------------------------------------------------------------------------
+
+/** 20 MB cap on the *decoded* file. Base64-encoded payload is ~1.33× this. */
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+function decodeBase64(content: string): Buffer {
+  // Strip data: URL prefix if present (e.g. "data:audio/mpeg;base64,...")
+  const cleaned = content.startsWith("data:")
+    ? content.slice(content.indexOf(",") + 1)
+    : content;
+  const buf = Buffer.from(cleaned, "base64");
+  if (buf.length === 0) {
+    throw new Error("content_base64 decoded to 0 bytes — invalid base64?");
+  }
+  if (buf.length > MAX_UPLOAD_BYTES) {
+    throw new Error(
+      `File is ${(buf.length / 1024 / 1024).toFixed(1)} MB; max is ` +
+        `${MAX_UPLOAD_BYTES / 1024 / 1024} MB. For larger files, host the file ` +
+        `somewhere publicly reachable and use the URL-based send_audio / ` +
+        `send_document tool instead.`,
+    );
+  }
+  return buf;
+}
+
+async function callTelegramMultipart(
+  method: string,
+  fields: Record<string, string | number>,
+  fileField: { name: string; filename: string; mime: string; data: Buffer },
+) {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(fields)) {
+    form.append(k, String(v));
+  }
+  form.append(
+    fileField.name,
+    new Blob([new Uint8Array(fileField.data)], { type: fileField.mime }),
+    fileField.filename,
+  );
+  const r = await fetch(`${TELEGRAM_API}/${method}`, {
+    method: "POST",
+    body: form,
+  });
+  const data = (await r.json()) as {
+    ok: boolean;
+    description?: string;
+    result?: unknown;
+  };
+  if (!r.ok || !data.ok) {
+    throw new Error(
+      `Telegram ${method} failed: ${data.description ?? r.statusText}`,
+    );
+  }
+  return data.result;
+}
+
+function guessMime(filename: string, fallback: string): string {
+  const ext = filename.toLowerCase().split(".").pop() ?? "";
+  const map: Record<string, string> = {
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
+    ogg: "audio/ogg",
+    opus: "audio/opus",
+    wav: "audio/wav",
+    flac: "audio/flac",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    gif: "image/gif",
+    webp: "image/webp",
+    pdf: "application/pdf",
+    zip: "application/zip",
+    txt: "text/plain",
+    json: "application/json",
+    csv: "text/csv",
+    mp4: "video/mp4",
+    mov: "video/quicktime",
+    webm: "video/webm",
+  };
+  return map[ext] ?? fallback;
+}
+
 function ok(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
@@ -193,6 +281,105 @@ mcpServer.tool(
     if (filename) payload["file_name"] = filename;
     await callTelegram("sendDocument", payload);
     return ok(`Document sent to chat ${cid}.`);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Local-file upload variants. Use these when the file exists on the client's
+// machine (Cowork sandbox, user's laptop, etc.) and you don't have a public
+// URL. Claude reads the file with its Read tool, base64-encodes it, and passes
+// it here; the bot decodes and uploads directly to Telegram via multipart.
+//
+// Max 20 MB per file (limit set on the bot side; larger payloads also strain
+// the MCP transport). For bigger files, host them and use the URL variants.
+// ---------------------------------------------------------------------------
+
+/** Send a local audio file (MP3/M4A/etc, ≤20 MB). */
+mcpServer.tool(
+  "send_audio_data",
+  {
+    filename: z
+      .string()
+      .min(1)
+      .max(255)
+      .describe("Filename like 'song.mp3'. Used for Telegram's display + mime guess."),
+    content_base64: z
+      .string()
+      .min(1)
+      .describe("Base64-encoded raw audio bytes. Data: URLs are accepted too."),
+    caption: z.string().max(1024).optional(),
+    title: z.string().max(64).optional(),
+    performer: z.string().max(64).optional(),
+    chat_id: z.number().int().optional(),
+  },
+  async ({ filename, content_base64, caption, title, performer, chat_id }) => {
+    const cid = resolveChatId(chat_id);
+    const buf = decodeBase64(content_base64);
+    const fields: Record<string, string | number> = { chat_id: cid };
+    if (caption) fields["caption"] = caption;
+    if (title) fields["title"] = title;
+    if (performer) fields["performer"] = performer;
+    await callTelegramMultipart("sendAudio", fields, {
+      name: "audio",
+      filename,
+      mime: guessMime(filename, "audio/mpeg"),
+      data: buf,
+    });
+    return ok(
+      `Audio '${filename}' (${(buf.length / 1024).toFixed(0)} KB) sent to chat ${cid}.`,
+    );
+  },
+);
+
+/** Send a local image file (JPG/PNG/WebP, ≤20 MB). */
+mcpServer.tool(
+  "send_photo_data",
+  {
+    filename: z.string().min(1).max(255),
+    content_base64: z.string().min(1),
+    caption: z.string().max(1024).optional(),
+    chat_id: z.number().int().optional(),
+  },
+  async ({ filename, content_base64, caption, chat_id }) => {
+    const cid = resolveChatId(chat_id);
+    const buf = decodeBase64(content_base64);
+    const fields: Record<string, string | number> = { chat_id: cid };
+    if (caption) fields["caption"] = caption;
+    await callTelegramMultipart("sendPhoto", fields, {
+      name: "photo",
+      filename,
+      mime: guessMime(filename, "image/jpeg"),
+      data: buf,
+    });
+    return ok(
+      `Photo '${filename}' (${(buf.length / 1024).toFixed(0)} KB) sent to chat ${cid}.`,
+    );
+  },
+);
+
+/** Send any local file (≤20 MB) as a Telegram document. */
+mcpServer.tool(
+  "send_document_data",
+  {
+    filename: z.string().min(1).max(255),
+    content_base64: z.string().min(1),
+    caption: z.string().max(1024).optional(),
+    chat_id: z.number().int().optional(),
+  },
+  async ({ filename, content_base64, caption, chat_id }) => {
+    const cid = resolveChatId(chat_id);
+    const buf = decodeBase64(content_base64);
+    const fields: Record<string, string | number> = { chat_id: cid };
+    if (caption) fields["caption"] = caption;
+    await callTelegramMultipart("sendDocument", fields, {
+      name: "document",
+      filename,
+      mime: guessMime(filename, "application/octet-stream"),
+      data: buf,
+    });
+    return ok(
+      `Document '${filename}' (${(buf.length / 1024).toFixed(0)} KB) sent to chat ${cid}.`,
+    );
   },
 );
 
