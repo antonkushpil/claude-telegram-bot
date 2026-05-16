@@ -1,132 +1,205 @@
 # Claude × Telegram bot
 
 A small Telegram bot that forwards user messages to the Claude API and replies
-with Claude's answer. Runs in webhook mode on Railway.
+with Claude's answer. Runs in webhook mode on Railway. **Also** exposes an MCP
+endpoint so Claude (in any UI that supports custom connectors) can push
+messages, audio, photos, and documents back to your Telegram and read messages
+you recently sent the bot.
+
+Written in TypeScript, runs on Node 20.
 
 ## What's in this folder
 
 | File | Purpose |
 | --- | --- |
-| `bot.py` | The bot. Webhook in prod, long-polling locally. |
-| `requirements.txt` | Python deps (`python-telegram-bot`, `anthropic`). |
-| `Procfile` | Tells Railway how to start the process. |
-| `railway.json` | Railway build/deploy config (Nixpacks, restart policy). |
-| `runtime.txt` | Pins Python 3.12. |
-| `.env.example` | Documents the env vars you need to set. |
-| `.gitignore` | Keeps `.env` and caches out of git. |
+| `src/index.ts` | Hono HTTP server: Telegram webhook + MCP endpoint. |
+| `src/telegram.ts` | grammy bot handlers + Claude proxy. |
+| `src/mcp.ts` | MCP server with the six push/read tools. |
+| `src/db.ts` | SQLite persistence (owner chat_id + 24h message log). |
+| `src/config.ts` | Env var parsing in one place. |
+| `package.json` | npm deps + scripts. |
+| `tsconfig.json` | TypeScript config. |
+| `Procfile` | Railway start command. |
+| `railway.json` | Railway build config. |
+| `.env.example` | Documented env vars. |
+| `.gitignore` | Keeps `.env`, `node_modules`, `dist`, `bot.db` out of git. |
+
+## Architecture
+
+```
+                ┌────────────────────────────────┐
+                │  Railway service (one process) │
+   Telegram ◄──►│  POST /<TELEGRAM_BOT_TOKEN>    │ ◄── Telegram → Claude
+                │  /mcp-<MCP_SECRET>/mcp         │ ◄── Claude → Telegram (MCP)
+                │                                │
+                │  SQLite: chat_id + recent msgs │
+                └────────────────────────────────┘
+```
+
+One service, two surfaces. Telegram messages come in via the standard webhook
+and get answered by Claude. The MCP endpoint, mounted at a path containing a
+secret, lets Claude push messages/audio/photos/documents back to your Telegram
+and read the last 24h of messages you sent the bot.
 
 ## 1. Get your credentials
 
-1. **Telegram bot token** — open Telegram, message [@BotFather](https://t.me/BotFather),
-   send `/newbot`, follow prompts. Save the token (looks like `123456:ABC-xyz...`).
-2. **Anthropic API key** — go to <https://console.anthropic.com/>, create an API
-   key, save it.
+1. **Telegram bot token** — Telegram → [@BotFather](https://t.me/BotFather) →
+   `/newbot` → save the token.
+2. **Anthropic API key** — <https://console.anthropic.com> → API Keys →
+   Create Key.
 
-## 2. (Optional) Run locally with long polling
+## 2. Run locally
+
+The bot uses webhooks, so for local dev you need a public HTTPS tunnel
+(`ngrok`, `cloudflared`, or similar) — Telegram won't deliver to localhost.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+nvm use 20         # or any other way to get Node 20+
+npm install
 
 cp .env.example .env
-# fill in TELEGRAM_BOT_TOKEN and ANTHROPIC_API_KEY, leave PUBLIC_URL empty
-export $(grep -v '^#' .env | xargs)  # or use direnv / dotenv
-python bot.py
+# fill in TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY
+# set PUBLIC_URL to your ngrok https URL
+
+npm run dev        # tsx in watch mode
 ```
 
-Now open Telegram, find your bot, send `/start`. Replies come from Claude.
+In another terminal:
+
+```bash
+ngrok http 8080
+# copy the https URL into .env as PUBLIC_URL, then restart npm run dev
+```
+
+Open Telegram, find your bot, send `/start`. Replies come from Claude.
 
 ## 3. Deploy to Railway
 
-Railway is the simplest path: it builds from GitHub, gives you HTTPS, and
-exposes the public URL Telegram needs for webhooks.
-
-### a) Push this folder to GitHub
+### a) Push to GitHub
 
 ```bash
-git init
 git add .
-git commit -m "Claude telegram bot"
-gh repo create claude-telegram-bot --private --source=. --push
-# or: create a repo on github.com and push manually
+git commit -m "Rewrite in TypeScript: grammy + hono + better-sqlite3"
+git push
 ```
 
-### b) Create the Railway service
+Railway redeploys automatically.
 
-1. Go to <https://railway.app/> → **New Project** → **Deploy from GitHub repo**
-   → pick your repo.
-2. Railway detects Python, installs `requirements.txt`, and runs `python bot.py`
-   (from `Procfile` / `railway.json`).
-3. The first deploy will **crash** — that's expected; we haven't set env vars
-   yet.
+### b) Set environment variables
 
-### c) Set environment variables
-
-In the Railway project → your service → **Variables**, add:
+Service → **Variables**:
 
 | Variable | Value |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | from BotFather |
 | `ANTHROPIC_API_KEY` | from console.anthropic.com |
-| `PUBLIC_URL` | leave blank for now, we'll fill it in next |
-| `CLAUDE_MODEL` | `claude-sonnet-4-6` (optional) |
-| `WEBHOOK_SECRET` | any long random string (optional but recommended) |
+| `PUBLIC_URL` | your Railway domain (Settings → Networking → Generate Domain) |
+| `MCP_SECRET` | any long random string — needed to enable the MCP endpoint |
+| `CLAUDE_MODEL` | optional, default `claude-sonnet-4-6` |
+| `WEBHOOK_SECRET` | optional but recommended — any long random string |
 
-### d) Get a public URL
+Click the purple **Deploy** button to apply.
 
-In **Settings → Networking** click **Generate Domain**. You'll get something
-like `https://claude-telegram-bot-production.up.railway.app`.
+### c) Verify
 
-Copy it. Back in **Variables**, set:
+Deploy logs should show:
 
 ```
-PUBLIC_URL = https://claude-telegram-bot-production.up.railway.app
+[db] using /data/bot.db   (or ./bot.db without a volume)
+[boot] Telegram webhook set to https://.../<your-token>
+[boot] MCP endpoint enabled at /mcp-xxxx…/mcp
+[boot] listening on :8080
 ```
 
-Railway will redeploy automatically. On startup the bot calls
-`setWebhook` itself — no manual `curl` needed.
-
-### e) Verify
-
-1. Check Railway **Deploy Logs** — you should see:
-   `Starting in webhook mode on port 8080 -> https://.../<token>`
-2. (Optional) ask Telegram what it thinks the webhook is:
-   ```bash
-   curl "https://api.telegram.org/bot<YOUR_TOKEN>/getWebhookInfo"
-   ```
-   `url` should match `PUBLIC_URL/<YOUR_TOKEN>` and `pending_update_count`
-   should be 0.
-3. Open Telegram, message the bot — Claude replies.
+Open Telegram, send `/start` to your bot. Replies come from Claude.
 
 ## Commands
 
-- `/start` or `/help` — intro message.
+- `/start` or `/help` — intro message. Also records your chat_id so the MCP
+  can push to you.
 - `/reset` — clear conversation history for this chat.
 - `/model` — show which Claude model is active.
+- `/whoami` — print your chat_id and user_id.
 
-## Costs to keep in mind
+## 4. Enable Claude → Telegram (MCP custom connector)
 
-- **Railway** has a free starter trial; after that the cheapest hobby plan is
-  ~$5/month. The bot itself uses very little RAM/CPU.
-- **Anthropic** charges per token. A general chat bot with one user is cents
-  per day; if you open it to the public, add rate limits or per-user quotas.
+### Add the connector in Claude
 
-## Hardening ideas (not done here)
+1. Open <https://claude.ai/customize/connectors> (or Claude Desktop → Settings
+   → Connectors).
+2. Click **+** → **Add custom connector**.
+3. **Remote MCP server URL**: paste
 
-- Allow-list `update.effective_user.id` so only you can talk to the bot.
-- Persist history to Redis / Postgres instead of in-memory `dict`
-  (Railway restarts wipe the current history).
-- Add per-user rate limiting.
-- Handle voice messages, images, or documents (Claude supports vision).
+   ```
+   https://<your-railway-domain>/mcp-<MCP_SECRET>/mcp
+   ```
+
+4. Leave OAuth fields empty. The URL itself is the credential — anyone with
+   it can push messages through your bot, so don't share it.
+5. Click **Add**.
+
+In any chat: **+** at bottom-left → **Connectors** → toggle
+**telegram-bot-bridge** on.
+
+### Try it
+
+```
+You:    send me "hello from Claude" on my Telegram
+Claude: [calls send_message] → message arrives in your Telegram
+
+You:    what did I just send you on Telegram?
+Claude: [calls read_recent_messages] → digest of the last ~20 messages
+```
+
+### Tools the MCP exposes
+
+- `send_message(text)` — text to your Telegram
+- `send_photo(url, caption?)` — photo from a public URL
+- `send_audio(url, caption?, title?, performer?)` — MP3/M4A from URL
+- `send_document(url, caption?, filename?)` — any file ≤50 MB from URL
+- `send_typing()` — "typing…" indicator
+- `read_recent_messages(limit=20)` — last N messages you sent the bot (24h)
+
+For `send_audio` / `send_photo` / `send_document` Telegram fetches the URL
+server-side — the URL must be publicly reachable, but the file doesn't pass
+through your Railway service.
+
+## 5. Optional: persistent SQLite across deploys
+
+Without a Railway volume, `bot.db` is wiped on every redeploy — you'd have to
+`/start` the bot again and the message backlog resets. To keep state:
+
+1. Railway service → **Settings → Volumes** → **+ New Volume**.
+2. Mount path: `/data`. Size: 1 GB is plenty.
+3. Redeploy. The bot auto-detects `/data` and writes `bot.db` there.
+
+## Costs
+
+- **Railway** — ~$5/month after the free trial. The bot uses very little
+  RAM/CPU.
+- **Anthropic** — pay-per-token. A personal-use chat bot is cents per day.
+  Set a usage limit at <https://console.anthropic.com> → Billing → Limits.
 
 ## Troubleshooting
 
-- **Bot doesn't respond, no logs**: webhook not set. Check `PUBLIC_URL` exactly
-  matches the Railway domain (no trailing slash, includes `https://`). Hit
-  `getWebhookInfo` and look at `last_error_message`.
-- **`401 Unauthorized` from Anthropic**: bad/expired `ANTHROPIC_API_KEY`.
-- **`Conflict: terminated by other getUpdates request`**: you have a local
-  `python bot.py` still running in polling mode. Stop it — only one consumer
-  can read updates at a time.
-- **Replies are cut off**: bump `MAX_TOKENS`.
+- **`Conflict: terminated by other getUpdates request`** — you have a local
+  `npm run dev` still running. Only one consumer can read updates at a time;
+  stop it.
+- **`401 Unauthorized` from Anthropic** — bad/expired `ANTHROPIC_API_KEY`.
+- **Build fails: `gyp ERR! build error`** — `better-sqlite3` needs prebuilt
+  binaries; if Railway can't fetch them, add `npm_config_build_from_source=false`
+  to your Variables, or pin Node 20 LTS explicitly via `engines` in
+  `package.json` (already done).
+- **MCP connector returns 404** — `MCP_SECRET` not set, or the secret in the
+  URL doesn't match. Trailing slash matters: use `/mcp-<secret>/mcp` (no
+  trailing slash).
+- **`No owner chat_id is recorded`** — `/start` the bot in Telegram once, or
+  set the `OWNER_CHAT_ID` env var as a fallback.
+
+## Future ideas
+
+- Allow-list `from.id` so only you can talk to the bot.
+- Add a vision tool (Claude can describe images you send the bot).
+- Add yt-dlp + ffmpeg in the build for in-bot song splitting.
+- Move history to Postgres / Redis for cross-restart memory.
+- Per-user rate limiting.

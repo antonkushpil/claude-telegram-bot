@@ -3,15 +3,16 @@
 .env.*
 !.env.example
 
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# Node
+node_modules/
+dist/
+*.log
+npm-debug.log*
+.npm
+
+# SQLite (created at runtime)
+bot.db
+bot.db-*
 
 # OS / editors
 .DS_Store
