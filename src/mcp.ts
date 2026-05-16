@@ -61,8 +61,12 @@ async function callTelegram(method: string, payload: Record<string, unknown>) {
 // Telegram as multipart/form-data. No URL, no public hosting needed.
 // ---------------------------------------------------------------------------
 
-/** 20 MB cap on the *decoded* file. Base64-encoded payload is ~1.33× this. */
-const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+/**
+ * 40 MB cap on the *decoded* file. Base64-encoded payload is ~1.33× this
+ * (~53 MB on the wire). Telegram's own bot-API limit is 50 MB; the headroom
+ * keeps us under it. If MCP transport balks on big payloads, lower this.
+ */
+const MAX_UPLOAD_BYTES = 40 * 1024 * 1024;
 
 function decodeBase64(content: string): Buffer {
   // Strip data: URL prefix if present (e.g. "data:audio/mpeg;base64,...")
