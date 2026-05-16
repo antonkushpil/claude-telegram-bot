@@ -30,7 +30,8 @@ Written in TypeScript, runs on Node 20.
                 ┌────────────────────────────────┐
                 │  Railway service (one process) │
    Telegram ◄──►│  POST /<TELEGRAM_BOT_TOKEN>    │ ◄── Telegram → Claude
-                │  /mcp-<MCP_SECRET>/mcp         │ ◄── Claude → Telegram (MCP)
+                │  /mcp-<MCP_SECRET>/mcp         │ ◄── Claude → Telegram (MCP text/tools)
+                │  POST /send-file?secret=…      │ ◄── curl file upload (no base64 in context)
                 │                                │
                 │  SQLite: chat_id + recent msgs │
                 └────────────────────────────────┘
@@ -172,14 +173,56 @@ Telegram; capped at 40 MB).
 
 ### Sending a file from your computer
 
-You have two routes for local files:
+**Preferred: use the `/send-file` HTTP endpoint via `curl`.**
 
-1. **Keep the file in your Cowork-mounted folder** (default
-   `~/Documents/Claude/Projects/Telegram/`). Then just ask Claude:
-   *"Send `song.mp3` from the folder to my Telegram."* Claude reads the file
-   with its `Read` tool, base64-encodes it, and calls `send_audio_data`.
-2. **Drag the file into the Cowork chat input.** Same flow — it lands in the
-   sandbox's `uploads/` directory which Claude can read.
+The `send_document_data` / `send_audio_data` / `send_photo_data` MCP tools
+work by having Claude base64-encode the file and pass the bytes as a parameter.
+For anything larger than a few KB this fills up Claude's conversation context
+and causes the *"This conversation is too long"* error.
+
+The `/send-file` endpoint is the fix: Claude runs a single `curl` command in
+bash — the file bytes stream directly from disk to Railway to Telegram, and
+never enter Claude's context.
+
+```bash
+# Send a document
+curl -s \
+  -F "file=@/path/to/report.pdf" \
+  -F "type=document" \
+  -F "caption=Here is your report" \
+  "https://<your-railway-domain>/send-file?secret=<MCP_SECRET>"
+
+# Send an image
+curl -s \
+  -F "file=@/path/to/photo.jpg" \
+  -F "type=photo" \
+  "https://<your-railway-domain>/send-file?secret=<MCP_SECRET>"
+
+# Send audio with metadata
+curl -s \
+  -F "file=@/path/to/song.mp3" \
+  -F "type=audio" \
+  -F "title=My Song" \
+  -F "performer=Artist" \
+  "https://<your-railway-domain>/send-file?secret=<MCP_SECRET>"
+```
+
+**Form fields:**
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `file` | ✅ | The binary file. |
+| `type` | no | `document` (default) / `photo` / `audio` |
+| `caption` | no | Up to 1024 characters. |
+| `title` | no | Audio track title. |
+| `performer` | no | Audio artist name. |
+| `chat_id` | no | Override target chat; defaults to owner. |
+
+The `?secret=` query param must match `MCP_SECRET`.
+
+**Fallback (small files only):** The `send_*_data` MCP tools still work for
+very small files (<50 KB) when you don't want to use bash. For anything larger,
+always use `curl` + `/send-file`.
 
 For files >40 MB, upload them to any public host (Dropbox public link, GitHub
 release, S3 with a public ACL, etc.) and use the URL-based variants instead.

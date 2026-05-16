@@ -95,6 +95,102 @@ app.post(`/${config.telegramBotToken}`, async (c) => {
   return c.body(null, 200);
 });
 
+// ---------------------------------------------------------------------------
+// Direct file-upload endpoint — avoids passing base64 through Claude's context.
+//
+// Usage (from bash / curl):
+//   curl -s \
+//     -F "file=@/path/to/file.pdf;type=application/pdf" \
+//     -F "type=document" \
+//     -F "caption=My caption" \
+//     "https://<PUBLIC_URL>/send-file?secret=<MCP_SECRET>"
+//
+// Query param  ?secret=   must equal MCP_SECRET (same secret used for /mcp).
+// Form fields:
+//   file      — the binary file (required)
+//   type      — "document" | "photo" | "audio"  (default: document)
+//   caption   — optional caption (≤1024 chars)
+//   title     — optional audio track title
+//   performer — optional audio performer
+//   chat_id   — optional override (defaults to owner)
+// ---------------------------------------------------------------------------
+
+app.post("/send-file", async (c) => {
+  // Auth: require ?secret= matching MCP_SECRET (reuse the same secret).
+  if (!config.mcpSecret) {
+    return c.json({ ok: false, error: "MCP_SECRET not configured on server" }, 503);
+  }
+  const providedSecret = c.req.query("secret");
+  if (providedSecret !== config.mcpSecret) {
+    return c.json({ ok: false, error: "Unauthorized" }, 401);
+  }
+
+  let formData: FormData;
+  try {
+    formData = await c.req.formData();
+  } catch {
+    return c.json({ ok: false, error: "Could not parse multipart form data" }, 400);
+  }
+
+  const fileEntry = formData.get("file");
+  if (!(fileEntry instanceof File) && !(fileEntry instanceof Blob)) {
+    return c.json({ ok: false, error: "Missing 'file' field in form data" }, 400);
+  }
+
+  const type = (formData.get("type") as string | null)?.toLowerCase() ?? "document";
+  const caption = formData.get("caption") as string | null;
+  const title = formData.get("title") as string | null;
+  const performer = formData.get("performer") as string | null;
+  const chatIdRaw = formData.get("chat_id") as string | null;
+
+  let chatId: number;
+  try {
+    if (chatIdRaw) {
+      chatId = Number(chatIdRaw);
+    } else {
+      const cid = getOwnerChatIdOrFallback();
+      if (cid == null) throw new Error("No owner chat_id known — send /start to the bot first");
+      chatId = cid;
+    }
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 400);
+  }
+
+  // Rebuild as a fresh FormData for the Telegram API call.
+  const tgForm = new FormData();
+  tgForm.append("chat_id", String(chatId));
+  if (caption) tgForm.append("caption", caption);
+
+  let tgMethod: string;
+  let tgField: string;
+  if (type === "photo") {
+    tgMethod = "sendPhoto";
+    tgField = "photo";
+  } else if (type === "audio") {
+    tgMethod = "sendAudio";
+    tgField = "audio";
+    if (title) tgForm.append("title", title);
+    if (performer) tgForm.append("performer", performer);
+  } else {
+    tgMethod = "sendDocument";
+    tgField = "document";
+  }
+
+  const filename =
+    fileEntry instanceof File ? fileEntry.name : `upload.${type === "photo" ? "jpg" : "bin"}`;
+  tgForm.append(tgField, fileEntry, filename);
+
+  const r = await fetch(`${TELEGRAM_API}/${tgMethod}`, {
+    method: "POST",
+    body: tgForm,
+  });
+  const data = (await r.json()) as { ok: boolean; description?: string };
+  if (!r.ok || !data.ok) {
+    return c.json({ ok: false, error: data.description ?? r.statusText }, 502);
+  }
+  return c.json({ ok: true, sent: filename, chat_id: chatId });
+});
+
 // MCP endpoint — only mounted when MCP_SECRET is set.
 if (config.mcpSecret) {
   const mcpPath = `/mcp-${config.mcpSecret}/mcp`;
