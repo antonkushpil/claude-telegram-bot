@@ -19,6 +19,15 @@ export const mcpServer = new McpServer({
   version: "1.0.0",
 });
 
+export function createMcpServer() {
+  const server = new McpServer({
+    name: "telegram-bot-bridge",
+    version: "1.0.0",
+  });
+
+  return server;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
