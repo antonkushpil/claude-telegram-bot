@@ -219,7 +219,7 @@ if (config.mcpSecret) {
     // The transport writes to `res` directly. Tell Hono not to send a response.
     // Returning a Response object Hono will see `res.writableEnded` and skip
     // its own write. An empty body is the safe sentinel.
-    return c.body(null);
+    return new Promise<Response>(() => {});
   });
 }
 
