@@ -15,7 +15,7 @@ import { Hono } from "hono";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { config, TELEGRAM_API } from "./config.js";
 import { getOwnerChatIdOrFallback } from "./db.js";
-import { mcpServer } from "./mcp.js";
+import { createMcpServer } from "./mcp.js";
 import { bot } from "./telegram.js";
 
 // ---------------------------------------------------------------------------
@@ -40,10 +40,13 @@ async function getOrCreateTransport(
       mcpTransports.set(id, transport);
     },
   });
+  const server = createMcpServer();
+  await server.connect(transport);
+  
   transport.onclose = () => {
     if (transport.sessionId) mcpTransports.delete(transport.sessionId);
   };
-  await mcpServer.connect(transport);
+  
   return transport;
 }
 
