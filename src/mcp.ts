@@ -14,167 +14,13 @@ import { z } from "zod";
 import { TELEGRAM_API } from "./config.js";
 import { fetchRecent, getOwnerChatIdOrFallback } from "./db.js";
 
-export const mcpServer = new McpServer({
-  name: "telegram-bot-bridge",
-  version: "1.0.0",
-});
-
 export function createMcpServer() {
-  const server = new McpServer({
+  const mcpServer = new McpServer({
     name: "telegram-bot-bridge",
     version: "1.0.0",
   });
 
-  return server;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function resolveChatId(override?: number | null): number {
-  if (override != null) return Number(override);
-  const cid = getOwnerChatIdOrFallback();
-  if (cid == null) {
-    throw new Error(
-      "No owner chat_id is recorded. Ask the user to send /start to the bot " +
-        "in Telegram once, or set the OWNER_CHAT_ID env var.",
-    );
-  }
-  return cid;
-}
-
-async function callTelegram(method: string, payload: Record<string, unknown>) {
-  const r = await fetch(`${TELEGRAM_API}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = (await r.json()) as {
-    ok: boolean;
-    description?: string;
-    result?: unknown;
-  };
-  if (!r.ok || !data.ok) {
-    throw new Error(
-      `Telegram ${method} failed: ${data.description ?? r.statusText}`,
-    );
-  }
-  return data.result;
-}
-
-// ---------------------------------------------------------------------------
-// Direct file uploads — for files that exist only on the client (e.g. on the
-// user's laptop, or in Cowork's sandbox). Claude reads the file, base64-
-// encodes it, passes the bytes through MCP; we decode here and ship to
-// Telegram as multipart/form-data. No URL, no public hosting needed.
-// ---------------------------------------------------------------------------
-
-/**
- * 40 MB cap on the *decoded* file. Base64-encoded payload is ~1.33× this
- * (~53 MB on the wire). Telegram's own bot-API limit is 50 MB; the headroom
- * keeps us under it. If MCP transport balks on big payloads, lower this.
- */
-const MAX_UPLOAD_BYTES = 40 * 1024 * 1024;
-
-function decodeBase64(content: string): Buffer {
-  // Strip data: URL prefix if present (e.g. "data:audio/mpeg;base64,...")
-  const cleaned = content.startsWith("data:")
-    ? content.slice(content.indexOf(",") + 1)
-    : content;
-  const buf = Buffer.from(cleaned, "base64");
-  if (buf.length === 0) {
-    throw new Error("content_base64 decoded to 0 bytes — invalid base64?");
-  }
-  if (buf.length > MAX_UPLOAD_BYTES) {
-    throw new Error(
-      `File is ${(buf.length / 1024 / 1024).toFixed(1)} MB; max is ` +
-        `${MAX_UPLOAD_BYTES / 1024 / 1024} MB. For larger files, host the file ` +
-        `somewhere publicly reachable and use the URL-based send_audio / ` +
-        `send_document tool instead.`,
-    );
-  }
-  return buf;
-}
-
-async function callTelegramMultipart(
-  method: string,
-  fields: Record<string, string | number>,
-  fileField: { name: string; filename: string; mime: string; data: Buffer },
-) {
-  const form = new FormData();
-  for (const [k, v] of Object.entries(fields)) {
-    form.append(k, String(v));
-  }
-  form.append(
-    fileField.name,
-    new Blob([new Uint8Array(fileField.data)], { type: fileField.mime }),
-    fileField.filename,
-  );
-  const r = await fetch(`${TELEGRAM_API}/${method}`, {
-    method: "POST",
-    body: form,
-  });
-  const data = (await r.json()) as {
-    ok: boolean;
-    description?: string;
-    result?: unknown;
-  };
-  if (!r.ok || !data.ok) {
-    throw new Error(
-      `Telegram ${method} failed: ${data.description ?? r.statusText}`,
-    );
-  }
-  return data.result;
-}
-
-function guessMime(filename: string, fallback: string): string {
-  const ext = filename.toLowerCase().split(".").pop() ?? "";
-  const map: Record<string, string> = {
-    mp3: "audio/mpeg",
-    m4a: "audio/mp4",
-    aac: "audio/aac",
-    ogg: "audio/ogg",
-    opus: "audio/opus",
-    wav: "audio/wav",
-    flac: "audio/flac",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    png: "image/png",
-    gif: "image/gif",
-    webp: "image/webp",
-    pdf: "application/pdf",
-    zip: "application/zip",
-    txt: "text/plain",
-    json: "application/json",
-    csv: "text/csv",
-    mp4: "video/mp4",
-    mov: "video/quicktime",
-    webm: "video/webm",
-  };
-  return map[ext] ?? fallback;
-}
-
-function ok(text: string) {
-  return { content: [{ type: "text" as const, text }] };
-}
-
-function splitForTelegram(text: string, limit = 4000): string[] {
-  if (text.length <= limit) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > limit) {
-    let cut = remaining.lastIndexOf("\n\n", limit);
-    if (cut === -1) cut = remaining.lastIndexOf("\n", limit);
-    if (cut === -1 || cut < Math.floor(limit / 2)) cut = limit;
-    chunks.push(remaining.slice(0, cut).trimEnd());
-    remaining = remaining.slice(cut).trimStart();
-  }
-  if (remaining) chunks.push(remaining);
-  return chunks;
-}
-
-// ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 // Tools
 //
 // Note on the .tool() form: we use the 3-arg `(name, schemaShape, handler)`
@@ -421,3 +267,152 @@ mcpServer.tool(
     return ok(lines.join("\n"));
   },
 );
+
+  return mcpServer;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function resolveChatId(override?: number | null): number {
+  if (override != null) return Number(override);
+  const cid = getOwnerChatIdOrFallback();
+  if (cid == null) {
+    throw new Error(
+      "No owner chat_id is recorded. Ask the user to send /start to the bot " +
+        "in Telegram once, or set the OWNER_CHAT_ID env var.",
+    );
+  }
+  return cid;
+}
+
+async function callTelegram(method: string, payload: Record<string, unknown>) {
+  const r = await fetch(`${TELEGRAM_API}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = (await r.json()) as {
+    ok: boolean;
+    description?: string;
+    result?: unknown;
+  };
+  if (!r.ok || !data.ok) {
+    throw new Error(
+      `Telegram ${method} failed: ${data.description ?? r.statusText}`,
+    );
+  }
+  return data.result;
+}
+
+// ---------------------------------------------------------------------------
+// Direct file uploads — for files that exist only on the client (e.g. on the
+// user's laptop, or in Cowork's sandbox). Claude reads the file, base64-
+// encodes it, passes the bytes through MCP; we decode here and ship to
+// Telegram as multipart/form-data. No URL, no public hosting needed.
+// ---------------------------------------------------------------------------
+
+/**
+ * 40 MB cap on the *decoded* file. Base64-encoded payload is ~1.33× this
+ * (~53 MB on the wire). Telegram's own bot-API limit is 50 MB; the headroom
+ * keeps us under it. If MCP transport balks on big payloads, lower this.
+ */
+const MAX_UPLOAD_BYTES = 40 * 1024 * 1024;
+
+function decodeBase64(content: string): Buffer {
+  // Strip data: URL prefix if present (e.g. "data:audio/mpeg;base64,...")
+  const cleaned = content.startsWith("data:")
+    ? content.slice(content.indexOf(",") + 1)
+    : content;
+  const buf = Buffer.from(cleaned, "base64");
+  if (buf.length === 0) {
+    throw new Error("content_base64 decoded to 0 bytes — invalid base64?");
+  }
+  if (buf.length > MAX_UPLOAD_BYTES) {
+    throw new Error(
+      `File is ${(buf.length / 1024 / 1024).toFixed(1)} MB; max is ` +
+        `${MAX_UPLOAD_BYTES / 1024 / 1024} MB. For larger files, host the file ` +
+        `somewhere publicly reachable and use the URL-based send_audio / ` +
+        `send_document tool instead.`,
+    );
+  }
+  return buf;
+}
+
+async function callTelegramMultipart(
+  method: string,
+  fields: Record<string, string | number>,
+  fileField: { name: string; filename: string; mime: string; data: Buffer },
+) {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(fields)) {
+    form.append(k, String(v));
+  }
+  form.append(
+    fileField.name,
+    new Blob([new Uint8Array(fileField.data)], { type: fileField.mime }),
+    fileField.filename,
+  );
+  const r = await fetch(`${TELEGRAM_API}/${method}`, {
+    method: "POST",
+    body: form,
+  });
+  const data = (await r.json()) as {
+    ok: boolean;
+    description?: string;
+    result?: unknown;
+  };
+  if (!r.ok || !data.ok) {
+    throw new Error(
+      `Telegram ${method} failed: ${data.description ?? r.statusText}`,
+    );
+  }
+  return data.result;
+}
+
+function guessMime(filename: string, fallback: string): string {
+  const ext = filename.toLowerCase().split(".").pop() ?? "";
+  const map: Record<string, string> = {
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
+    ogg: "audio/ogg",
+    opus: "audio/opus",
+    wav: "audio/wav",
+    flac: "audio/flac",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    gif: "image/gif",
+    webp: "image/webp",
+    pdf: "application/pdf",
+    zip: "application/zip",
+    txt: "text/plain",
+    json: "application/json",
+    csv: "text/csv",
+    mp4: "video/mp4",
+    mov: "video/quicktime",
+    webm: "video/webm",
+  };
+  return map[ext] ?? fallback;
+}
+
+function ok(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+function splitForTelegram(text: string, limit = 4000): string[] {
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    let cut = remaining.lastIndexOf("\n\n", limit);
+    if (cut === -1) cut = remaining.lastIndexOf("\n", limit);
+    if (cut === -1 || cut < Math.floor(limit / 2)) cut = limit;
+    chunks.push(remaining.slice(0, cut).trimEnd());
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
