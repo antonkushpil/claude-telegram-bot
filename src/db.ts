@@ -267,18 +267,13 @@ export function clearHistory(chatId: number): void {
 // Post drafts (per chat, in-memory backed by DB for crash safety)
 // ---------------------------------------------------------------------------
 
-export interface PlatformCopy {
-  tiktok: string;
-  instagram: string;
-  reddit: string;
-}
-
 export interface PostDraft {
   userContext: string;
   imageBase64: string;
-  themes: Array<{ label: string; angle: string }>;
-  selectedAngle?: string;
-  copies?: PlatformCopy;
+  categories: string[];           // 10 items: 6 mandatory + 4 photo-context ones
+  selectedPlatform?: string;      // 'tiktok' | 'instagram' | 'reddit'
+  selectedCategory?: string;
+  previousDescriptions: string[]; // shown so far — never repeat
 }
 
 const upsertDraft = db.prepare(`

@@ -39,7 +39,6 @@ import {
   markGreetedToday,
   shouldGreetToday,
   type PostDraft,
-  type PlatformCopy,
 } from "./db.js";
 
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
@@ -73,13 +72,16 @@ function safeUnlink(p: string): void {
 const HAIKU = "claude-haiku-4-5-20251001";
 const VIDEO_SIZE_LIMIT = 1024 * 1024 * 1024; // 1 GB
 
-async function generateThemes(
+const MANDATORY_CATEGORIES = ["Sexy", "Flirting", "Emotions", "Casual", "Elegant", "Erotic"];
+
+/** Generate 4 photo-context categories to complement the 6 mandatory ones. */
+async function generateContextCategories(
   userContext: string,
   imageBase64: string,
-): Promise<Array<{ label: string; angle: string }>> {
+): Promise<string[]> {
   const msg = await anthropic.messages.create({
     model: HAIKU,
-    max_tokens: 512,
+    max_tokens: 200,
     messages: [
       {
         role: "user",
@@ -90,34 +92,67 @@ async function generateThemes(
           },
           {
             type: "text",
-            text: `Context: "${userContext}"\n\nSuggest exactly 3 short theme angles for a social media post about this photo. Each should be a distinct creative direction.\n\nRespond ONLY with valid JSON array, no markdown:\n[{"label":"emoji + 2-3 words","angle":"one sentence describing the creative focus"}]`,
+            text: `Context: "${userContext}"\n\nLook at this photo and suggest exactly 4 short category labels (1-2 words each) that would make good social media post angles — based on what you actually see (location, mood, style, activity, etc.). Do NOT suggest: Sexy, Flirting, Emotions, Casual, Elegant, Erotic — those are already covered.\n\nRespond ONLY with a JSON array of 4 strings, e.g. ["Travel", "Night Out", "Foodie", "Power Look"]`,
           },
         ],
       },
     ],
   });
 
-  const text = (msg.content[0] as Anthropic.TextBlock).text.trim();
+  const raw = (msg.content[0] as Anthropic.TextBlock).text.trim();
   try {
-    const parsed = JSON.parse(text) as Array<{ label: string; angle: string }>;
-    return parsed.slice(0, 3);
+    const parsed = JSON.parse(raw) as string[];
+    return parsed.slice(0, 4);
   } catch {
-    return [
-      { label: "✨ Vibes", angle: "Focus on the mood and atmosphere" },
-      { label: "📍 Place", angle: "Highlight the location and setting" },
-      { label: "😊 Moment", angle: "Capture the personal connection and emotion" },
-    ];
+    return ["Mood", "Lifestyle", "Aesthetic", "Moment"];
   }
 }
 
-async function generateCopy(
-  userContext: string,
-  angle: string,
+const PLATFORM_TREND_GUIDES: Record<string, string> = {
+  tiktok: `TikTok 2025 trends:
+- Hook in first 3 words (question, bold claim, or relatable statement)
+- Very short sentences, punchy rhythm
+- Lowercase or mixed case feels more authentic
+- 1-3 sentences max before hashtags
+- 5-8 hashtags: mix of #fyp #foryou with niche tags
+- Emojis used sparingly but strategically (1-3 max)
+- Slang: "it's giving", "no cap", "lowkey", "slay", "rent free", "understood the assignment"`,
+
+  instagram: `Instagram 2025 trends:
+- First line is the hook (shows before "more" cutoff — max ~125 chars)
+- Conversational, slightly longer captions are performing well
+- Authentic > polished — people respond to real moments
+- Line breaks between sentences for readability
+- CTA at end (save this, tag someone, tell me in comments)
+- 8-15 hashtags, mix of sizes
+- Emojis used as bullet points or accent, not decoration`,
+
+  reddit: `Reddit 2025 trends:
+- Title: direct, specific, sometimes self-deprecating or curious
+- Body: 1-3 sentences, genuine voice, no hashtags, no emojis or minimal
+- Subreddit matters — suggest the most fitting one
+- Avoid obvious humble-brag; frame as sharing, not showing off
+- Relatable or slightly vulnerable angle performs best`,
+};
+
+/** Generate one fresh description for platform + category, never repeating previous ones. */
+async function generateDescription(
   imageBase64: string,
-): Promise<PlatformCopy> {
+  userContext: string,
+  platform: string,
+  category: string,
+  previousDescriptions: string[],
+): Promise<string> {
+  const trendGuide = PLATFORM_TREND_GUIDES[platform] ?? "";
+  const avoidBlock = previousDescriptions.length > 0
+    ? `\n\nDO NOT write anything similar to these already-shown descriptions:\n${previousDescriptions.map((d, i) => `${i + 1}. ${d}`).join("\n")}`
+    : "";
+
+  const platformLabel = platform === "reddit" ? "Reddit" : platform === "instagram" ? "Instagram" : "TikTok";
+
   const msg = await anthropic.messages.create({
     model: HAIKU,
-    max_tokens: 1024,
+    max_tokens: 400,
     messages: [
       {
         role: "user",
@@ -128,23 +163,14 @@ async function generateCopy(
           },
           {
             type: "text",
-            text: `Context: "${userContext}"\nAngle: "${angle}"\n\nGenerate social media copy. Respond ONLY with valid JSON, no markdown:\n{\n  "tiktok": "casual Gen-Z 1-3 sentences + newline + 5-8 hashtags incl #fyp",\n  "instagram": "aspirational 2-4 sentences + CTA + newline + 10-15 hashtags",\n  "reddit": "Title: short punchy title\\nBody: authentic 1-3 sentences, no hashtags"\n}`,
+            text: `You are writing a ${platformLabel} post caption.\n\nPhoto context: "${userContext}"\nCategory/vibe: "${category}"\n\n${trendGuide}${avoidBlock}\n\nAnalyze the photo carefully — the person's expression, outfit, setting, lighting, mood — then write ONE caption that:\n- Fits the "${category}" vibe authentically\n- Follows current ${platformLabel} trends above\n- Feels human and natural, not AI-generated\n- Is genuinely different from any previous suggestions\n\nReturn ONLY the caption text. No explanations, no quotes around it.`,
           },
         ],
       },
     ],
   });
 
-  const text = (msg.content[0] as Anthropic.TextBlock).text.trim();
-  try {
-    return JSON.parse(text) as PlatformCopy;
-  } catch {
-    return {
-      tiktok: "living my best life ✨\n#fyp #viral #mood",
-      instagram: "Every moment is worth capturing. 📸\n#photography #lifestyle #memories",
-      reddit: "Title: Found a gem\nBody: Sometimes you just have to share the good stuff.",
-    };
-  }
+  return (msg.content[0] as Anthropic.TextBlock).text.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -238,17 +264,25 @@ async function uploadAndDeleteVideo(
 // Keyboard builders
 // ---------------------------------------------------------------------------
 
-function themeKeyboard(themes: Array<{ label: string }>): InlineKeyboard {
+function platformKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("📸 TikTok", "pl:tiktok")
+    .text("📷 Instagram", "pl:instagram")
+    .text("🤖 Reddit", "pl:reddit");
+}
+
+function categoryKeyboard(categories: string[]): InlineKeyboard {
   const kb = new InlineKeyboard();
-  themes.forEach((t, i) => kb.text(t.label, `t:${i}`).row());
+  categories.forEach((cat, i) => {
+    kb.text(cat, `cat:${i}`);
+    if (i % 2 === 1) kb.row(); // 2 per row
+  });
+  if (categories.length % 2 !== 0) kb.row();
   return kb;
 }
 
-function platformKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("📸 TikTok", "p:tiktok")
-    .text("📷 Instagram", "p:instagram")
-    .text("🤖 Reddit", "p:reddit");
+function refreshKeyboard(): InlineKeyboard {
+  return new InlineKeyboard().text("🔄 Try another", "ref");
 }
 
 // ---------------------------------------------------------------------------
@@ -303,15 +337,16 @@ async function processMedia(
       const imageBase64 = readFileSync(outPath).toString("base64");
       await uploadAndDeletePhoto(chatId, outPath, cleanCaption); // outPath deleted inside
 
-      // 5. Generate theme buttons via Claude Haiku
+      // 5. Generate categories: 6 mandatory + 4 from photo context
       await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
-      const themes = await generateThemes(userContext, imageBase64);
+      const contextCats = await generateContextCategories(userContext, imageBase64);
+      const categories = [...MANDATORY_CATEGORIES, ...contextCats]; // 10 total
 
-      const draft: PostDraft = { userContext, imageBase64, themes };
+      const draft: PostDraft = { userContext, imageBase64, categories, previousDescriptions: [] };
       saveDraft(chatId, draft);
 
-      await ctx.api.sendMessage(chatId, "Choose a creative angle for your post:", {
-        reply_markup: themeKeyboard(themes),
+      await ctx.api.sendMessage(chatId, "Choose a platform:", {
+        reply_markup: platformKeyboard(),
       });
       return;
     }
@@ -518,48 +553,74 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  // --- Theme selection ---
-  if (data.startsWith("t:")) {
-    const idx = parseInt(data.slice(2), 10);
-    const theme = draft.themes[idx];
-    if (!theme) return;
+  // --- Platform selection (first step) ---
+  if (data.startsWith("pl:")) {
+    const platform = data.slice(3);
+    draft.selectedPlatform = platform;
+    draft.selectedCategory = undefined;
+    draft.previousDescriptions = [];
+    saveDraft(chatId, draft);
 
-    draft.selectedAngle = theme.angle;
-    await ctx.api.sendMessage(chatId, `✅ *${theme.label}*\n\nGenerating copy for all platforms...`, { parse_mode: "Markdown" });
+    const platformLabel: Record<string, string> = { tiktok: "📸 TikTok", instagram: "📷 Instagram", reddit: "🤖 Reddit" };
+    await ctx.api.sendMessage(
+      chatId,
+      `${platformLabel[platform] ?? platform} — choose a category:`,
+      { reply_markup: categoryKeyboard(draft.categories) },
+    );
+    return;
+  }
+
+  // --- Category selection ---
+  if (data.startsWith("cat:")) {
+    const idx = parseInt(data.slice(4), 10);
+    const category = draft.categories[idx];
+    if (!category || !draft.selectedPlatform) return;
+
+    draft.selectedCategory = category;
+    saveDraft(chatId, draft);
+
     await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
-
     try {
-      const copies = await generateCopy(draft.userContext, theme.angle, draft.imageBase64);
-      draft.copies = copies;
+      const description = await generateDescription(
+        draft.imageBase64,
+        draft.userContext,
+        draft.selectedPlatform,
+        category,
+        draft.previousDescriptions,
+      );
+      draft.previousDescriptions.push(description);
       saveDraft(chatId, draft);
 
-      await ctx.api.sendMessage(chatId, "Pick a platform to get your copy:", {
-        reply_markup: platformKeyboard(),
-      });
+      await ctx.api.sendMessage(chatId, description, { reply_markup: refreshKeyboard() });
     } catch (err) {
-      await ctx.api.sendMessage(chatId, `⚠️ Error generating copy: ${String(err)}`);
+      await ctx.api.sendMessage(chatId, `⚠️ Error: ${String(err)}`);
     }
     return;
   }
 
-  // --- Platform selection ---
-  if (data.startsWith("p:")) {
-    const platform = data.slice(2) as "tiktok" | "instagram" | "reddit";
-    if (!draft.copies) {
-      await ctx.api.sendMessage(chatId, "⚠️ No copy found. Please select a theme first.");
+  // --- Refresh: generate a new description for same platform + category ---
+  if (data === "ref") {
+    if (!draft.selectedPlatform || !draft.selectedCategory) {
+      await ctx.api.sendMessage(chatId, "⚠️ Please select a platform and category first.");
       return;
     }
 
-    const labels: Record<string, string> = { tiktok: "📸 TikTok", instagram: "📷 Instagram", reddit: "🤖 Reddit" };
-    const body = draft.copies[platform];
-    const text = `${labels[platform]}\n\n${body}`;
+    await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+    try {
+      const description = await generateDescription(
+        draft.imageBase64,
+        draft.userContext,
+        draft.selectedPlatform,
+        draft.selectedCategory,
+        draft.previousDescriptions,
+      );
+      draft.previousDescriptions.push(description);
+      saveDraft(chatId, draft);
 
-    for (const chunk of splitForTelegram(text)) {
-      await ctx.api.sendMessage(chatId, chunk);
+      await ctx.api.sendMessage(chatId, description, { reply_markup: refreshKeyboard() });
+    } catch (err) {
+      await ctx.api.sendMessage(chatId, `⚠️ Error: ${String(err)}`);
     }
-
-    // Offer other platforms
-    await ctx.api.sendMessage(chatId, "Need another platform?", { reply_markup: platformKeyboard() });
     return;
   }
 });
