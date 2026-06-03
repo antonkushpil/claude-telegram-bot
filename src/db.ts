@@ -1,11 +1,11 @@
 /**
  * SQLite persistence using better-sqlite3 (synchronous, fast, no callbacks).
  *
- * Stores:
- *  - The owner's Telegram chat_id (single row, learned from /start or any
- *    incoming message).
- *  - A 24h rolling log of incoming text messages, used by the MCP
- *    read_recent_messages tool.
+ * Tables:
+ *  - owner              — single-row owner chat_id, learned from /start.
+ *  - recent_messages    — 24h rolling log of incoming messages (used by MCP).
+ *  - conversation_history — per-chat Claude conversation turns (persistent).
+ *  - post_drafts        — per-chat photo-processing state (themes, copy, etc.).
  *
  * Path strategy: if /data is writable (Railway persistent volume), use
  * /data/bot.db. Otherwise fall back to ./bot.db (wiped on each redeploy).
@@ -54,6 +54,30 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_recent_ts ON recent_messages(ts);
+
+  CREATE TABLE IF NOT EXISTS conversation_history (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    role    TEXT NOT NULL,   -- 'user' | 'assistant'
+    content TEXT NOT NULL,
+    ts      INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conv_chat ON conversation_history(chat_id, ts);
+
+  CREATE TABLE IF NOT EXISTS post_drafts (
+    chat_id INTEGER PRIMARY KEY,
+    data    TEXT NOT NULL,   -- JSON blob
+    ts      INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS users (
+    chat_id            INTEGER PRIMARY KEY,
+    name               TEXT,                -- null until user provides it
+    pending_action     TEXT,                -- e.g. 'awaiting_name'
+    last_greeted_date  TEXT,                -- 'YYYY-MM-DD' in UTC
+    created_at         INTEGER NOT NULL
+  );
 `);
 
 // Migrate existing databases that pre-date the media columns.
@@ -108,7 +132,7 @@ export function getOwnerChatIdOrFallback(): number | null {
 }
 
 // ---------------------------------------------------------------------------
-// Incoming message log (24h)
+// Incoming message log (24h) — used by MCP read_recent_messages
 // ---------------------------------------------------------------------------
 
 const insertMessage = db.prepare(`
@@ -191,4 +215,181 @@ export function fetchRecent(limit = 20): RecentMessage[] {
       ts: r.ts,
     }))
     .reverse(); // oldest first
+}
+
+// ---------------------------------------------------------------------------
+// Conversation history (persistent, per chat)
+// ---------------------------------------------------------------------------
+
+export type ConvRole = "user" | "assistant";
+export interface ConvTurn { role: ConvRole; content: string }
+
+const CONV_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const MAX_CONV_TURNS = 20; // keep last 20 turns per chat
+
+const insertTurn = db.prepare(`
+  INSERT INTO conversation_history (chat_id, role, content, ts)
+  VALUES (@chatId, @role, @content, @ts)
+`);
+
+const selectTurns = db.prepare(`
+  SELECT role, content FROM conversation_history
+  WHERE chat_id = @chatId
+  ORDER BY ts DESC
+  LIMIT @limit
+`) as Database.Statement<{ chatId: number; limit: number }, { role: string; content: string }>;
+
+const deleteTurns = db.prepare(
+  "DELETE FROM conversation_history WHERE chat_id = ?",
+);
+
+const pruneOldTurns = db.prepare(
+  "DELETE FROM conversation_history WHERE ts < ?",
+);
+
+export function appendTurn(chatId: number, role: ConvRole, content: string): void {
+  const now = Math.floor(Date.now() / 1000);
+  insertTurn.run({ chatId, role, content, ts: now });
+  // prune globally stale turns once in a while (cheap)
+  if (Math.random() < 0.05) pruneOldTurns.run(now - CONV_TTL_SECONDS);
+}
+
+export function getHistory(chatId: number): ConvTurn[] {
+  const rows = selectTurns.all({ chatId, limit: MAX_CONV_TURNS });
+  return rows.reverse().map((r) => ({ role: r.role as ConvRole, content: r.content }));
+}
+
+export function clearHistory(chatId: number): void {
+  deleteTurns.run(chatId);
+}
+
+// ---------------------------------------------------------------------------
+// Post drafts (per chat, in-memory backed by DB for crash safety)
+// ---------------------------------------------------------------------------
+
+export interface PlatformCopy {
+  tiktok: string;
+  instagram: string;
+  reddit: string;
+}
+
+export interface PostDraft {
+  userContext: string;
+  imageBase64: string;
+  themes: Array<{ label: string; angle: string }>;
+  selectedAngle?: string;
+  copies?: PlatformCopy;
+}
+
+const upsertDraft = db.prepare(`
+  INSERT INTO post_drafts (chat_id, data, ts)
+  VALUES (@chatId, @data, @ts)
+  ON CONFLICT(chat_id) DO UPDATE SET data = excluded.data, ts = excluded.ts
+`);
+
+const selectDraft = db.prepare(
+  "SELECT data FROM post_drafts WHERE chat_id = ?",
+) as Database.Statement<[number], { data: string }>;
+
+const deleteDraft = db.prepare(
+  "DELETE FROM post_drafts WHERE chat_id = ?",
+);
+
+export function saveDraft(chatId: number, draft: PostDraft): void {
+  upsertDraft.run({
+    chatId,
+    data: JSON.stringify(draft),
+    ts: Math.floor(Date.now() / 1000),
+  });
+}
+
+export function loadDraft(chatId: number): PostDraft | null {
+  const row = selectDraft.get(chatId);
+  if (!row) return null;
+  try { return JSON.parse(row.data) as PostDraft; } catch { return null; }
+}
+
+export function deleteDraftForChat(chatId: number): void {
+  deleteDraft.run(chatId);
+}
+
+// ---------------------------------------------------------------------------
+// Users (multi-user name + session tracking)
+// ---------------------------------------------------------------------------
+
+export interface UserRecord {
+  chatId: number;
+  name: string | null;
+  pendingAction: string | null;
+  lastGreetedDate: string | null;
+}
+
+const upsertUser = db.prepare(`
+  INSERT INTO users (chat_id, name, pending_action, last_greeted_date, created_at)
+  VALUES (@chatId, @name, @pendingAction, @lastGreetedDate, @createdAt)
+  ON CONFLICT(chat_id) DO UPDATE SET
+    name              = COALESCE(excluded.name, users.name),
+    pending_action    = excluded.pending_action,
+    last_greeted_date = excluded.last_greeted_date
+`);
+
+const selectUser = db.prepare(
+  "SELECT chat_id, name, pending_action, last_greeted_date FROM users WHERE chat_id = ?",
+) as Database.Statement<[number], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null }>;
+
+const updateUserName = db.prepare(
+  "UPDATE users SET name = @name, pending_action = NULL WHERE chat_id = @chatId",
+);
+
+const updatePendingAction = db.prepare(
+  "UPDATE users SET pending_action = @pendingAction WHERE chat_id = @chatId",
+);
+
+const updateLastGreetedDate = db.prepare(
+  "UPDATE users SET last_greeted_date = @date WHERE chat_id = @chatId",
+);
+
+export function getUser(chatId: number): UserRecord | null {
+  const row = selectUser.get(chatId);
+  if (!row) return null;
+  return {
+    chatId: row.chat_id,
+    name: row.name,
+    pendingAction: row.pending_action,
+    lastGreetedDate: row.last_greeted_date,
+  };
+}
+
+/** Ensure user row exists. Returns the record. */
+export function ensureUser(chatId: number): UserRecord {
+  const existing = getUser(chatId);
+  if (existing) return existing;
+  upsertUser.run({
+    chatId,
+    name: null,
+    pendingAction: "awaiting_name",
+    lastGreetedDate: null,
+    createdAt: Math.floor(Date.now() / 1000),
+  });
+  return getUser(chatId)!;
+}
+
+export function setUserName(chatId: number, name: string): void {
+  updateUserName.run({ chatId, name: name.trim() });
+}
+
+export function setUserPendingAction(chatId: number, action: string | null): void {
+  updatePendingAction.run({ chatId, pendingAction: action });
+}
+
+export function markGreetedToday(chatId: number): void {
+  const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+  updateLastGreetedDate.run({ chatId, date: today });
+}
+
+/** Returns true if user hasn't been greeted today (UTC). */
+export function shouldGreetToday(user: UserRecord): boolean {
+  if (!user.name) return false;
+  const today = new Date().toISOString().slice(0, 10);
+  return user.lastGreetedDate !== today;
 }
