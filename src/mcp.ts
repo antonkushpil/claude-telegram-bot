@@ -242,7 +242,11 @@ mcpServer.tool(
   },
 );
 
-/** Return up to `limit` recent text messages (24h), oldest first. */
+/**
+ * Return up to `limit` recent messages (24h), oldest first.
+ * Media messages include file_url, file_type, and file_name so Claude can
+ * pass the URL to download_file to fetch the bytes for processing.
+ */
 mcpServer.tool(
   "read_recent_messages",
   {
@@ -262,9 +266,56 @@ mcpServer.tool(
         new Date(r.ts * 1000).toISOString().slice(0, 16).replace("T", " ") +
         "Z";
       const who = r.username ? `@${r.username}` : `user ${r.userId ?? "?"}`;
-      return `[${when}] ${who}: ${r.text}`;
+      let line = `[${when}] ${who}: ${r.text || "(no caption)"}`;
+      if (r.fileUrl) {
+        line += `\n  → [${r.fileType ?? "file"}] file_name=${r.fileName ?? "unknown"} file_url=${r.fileUrl}`;
+      }
+      return line;
     });
-    return ok(lines.join("\n"));
+    return ok(lines.join("\n\n"));
+  },
+);
+
+/**
+ * Download a Telegram file by URL and return its contents as base64.
+ * Use after read_recent_messages returns a file_url — pass it here to get
+ * the raw bytes so Claude can strip metadata and send the clean file back.
+ * Max 40 MB.
+ */
+mcpServer.tool(
+  "download_file",
+  {
+    url: z
+      .string()
+      .url()
+      .describe("The file_url from read_recent_messages."),
+    filename: z
+      .string()
+      .min(1)
+      .describe("Expected filename (e.g. photo_ABC.jpg). Used to infer file type."),
+  },
+  async ({ url, filename }) => {
+    const MAX_BYTES = 40 * 1024 * 1024;
+    const r = await fetch(url);
+    if (!r.ok) {
+      throw new Error(`download_file: HTTP ${r.status} ${r.statusText}`);
+    }
+    const contentLength = r.headers.get("content-length");
+    if (contentLength && Number(contentLength) > MAX_BYTES) {
+      throw new Error(
+        `File is ${(Number(contentLength) / 1024 / 1024).toFixed(1)} MB — exceeds 40 MB limit.`,
+      );
+    }
+    const buffer = await r.arrayBuffer();
+    if (buffer.byteLength > MAX_BYTES) {
+      throw new Error(
+        `File is ${(buffer.byteLength / 1024 / 1024).toFixed(1)} MB — exceeds 40 MB limit.`,
+      );
+    }
+    const base64 = Buffer.from(buffer).toString("base64");
+    return ok(
+      `filename=${filename}\nsize_kb=${(buffer.byteLength / 1024).toFixed(0)}\ncontent_base64=${base64}`,
+    );
   },
 );
 

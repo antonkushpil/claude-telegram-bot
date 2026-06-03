@@ -46,12 +46,24 @@ db.exec(`
     chat_id     INTEGER NOT NULL,
     user_id     INTEGER,
     username    TEXT,
-    text        TEXT NOT NULL,
+    text        TEXT NOT NULL DEFAULT '',
+    file_url    TEXT,
+    file_type   TEXT,
+    file_name   TEXT,
     ts          INTEGER NOT NULL
   );
 
   CREATE INDEX IF NOT EXISTS idx_recent_ts ON recent_messages(ts);
 `);
+
+// Migrate existing databases that pre-date the media columns.
+for (const col of [
+  "ALTER TABLE recent_messages ADD COLUMN file_url  TEXT",
+  "ALTER TABLE recent_messages ADD COLUMN file_type TEXT",
+  "ALTER TABLE recent_messages ADD COLUMN file_name TEXT",
+]) {
+  try { db.exec(col); } catch { /* column already exists */ }
+}
 
 export const MESSAGE_TTL_SECONDS = 24 * 60 * 60;
 
@@ -100,8 +112,8 @@ export function getOwnerChatIdOrFallback(): number | null {
 // ---------------------------------------------------------------------------
 
 const insertMessage = db.prepare(`
-  INSERT INTO recent_messages (chat_id, user_id, username, text, ts)
-  VALUES (@chatId, @userId, @username, @text, @ts)
+  INSERT INTO recent_messages (chat_id, user_id, username, text, file_url, file_type, file_name, ts)
+  VALUES (@chatId, @userId, @username, @text, @fileUrl, @fileType, @fileName, @ts)
 `);
 
 const pruneOldMessages = db.prepare(
@@ -109,7 +121,7 @@ const pruneOldMessages = db.prepare(
 );
 
 const selectRecent = db.prepare(`
-  SELECT chat_id, user_id, username, text, ts
+  SELECT chat_id, user_id, username, text, file_url, file_type, file_name, ts
   FROM recent_messages
   WHERE ts >= @cutoff
   ORDER BY ts DESC
@@ -121,6 +133,9 @@ const selectRecent = db.prepare(`
     user_id: number | null;
     username: string | null;
     text: string;
+    file_url: string | null;
+    file_type: string | null;
+    file_name: string | null;
     ts: number;
   }
 >;
@@ -130,14 +145,20 @@ export function recordIncoming(args: {
   userId: number | null;
   username: string | null;
   text: string;
+  fileUrl?: string | null;
+  fileType?: string | null;
+  fileName?: string | null;
 }): void {
-  if (!args.text) return;
+  if (!args.text && !args.fileUrl) return;
   const now = Math.floor(Date.now() / 1000);
   insertMessage.run({
     chatId: args.chatId,
     userId: args.userId,
     username: args.username,
-    text: args.text,
+    text: args.text || "",
+    fileUrl: args.fileUrl ?? null,
+    fileType: args.fileType ?? null,
+    fileName: args.fileName ?? null,
     ts: now,
   });
   pruneOldMessages.run(now - MESSAGE_TTL_SECONDS);
@@ -148,6 +169,9 @@ export interface RecentMessage {
   userId: number | null;
   username: string | null;
   text: string;
+  fileUrl: string | null;
+  fileType: string | null;
+  fileName: string | null;
   ts: number;
 }
 
@@ -161,6 +185,9 @@ export function fetchRecent(limit = 20): RecentMessage[] {
       userId: r.user_id,
       username: r.username,
       text: r.text,
+      fileUrl: r.file_url,
+      fileType: r.file_type,
+      fileName: r.file_name,
       ts: r.ts,
     }))
     .reverse(); // oldest first

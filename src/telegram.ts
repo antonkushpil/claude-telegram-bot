@@ -11,7 +11,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Context } from "grammy";
 import { Bot } from "grammy";
-import { config, TELEGRAM_MAX_MSG } from "./config.js";
+import { config, TELEGRAM_API, TELEGRAM_MAX_MSG } from "./config.js";
 import { recordIncoming, setOwner } from "./db.js";
 
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
@@ -73,6 +73,24 @@ async function askClaude(history: Turn[], userText: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Resolve a Telegram file_id to a direct download URL via getFile API. */
+async function resolveFileUrl(fileId: string): Promise<string> {
+  const r = await fetch(`${TELEGRAM_API}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  const data = (await r.json()) as {
+    ok: boolean;
+    result?: { file_path?: string };
+    description?: string;
+  };
+  if (!data.ok || !data.result?.file_path) {
+    throw new Error(`getFile failed for ${fileId}: ${data.description ?? "unknown"}`);
+  }
+  return `https://api.telegram.org/file/bot${config.telegramBotToken}/${data.result.file_path}`;
+}
+
+// ---------------------------------------------------------------------------
 // Bot wiring
 // ---------------------------------------------------------------------------
 
@@ -110,6 +128,113 @@ bot.command("whoami", async (ctx) => {
     `chat_id: ${ctx.chat?.id ?? "n/a"}\nuser_id: ${ctx.from?.id ?? "n/a"}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Media handlers — photo, video, document
+// ---------------------------------------------------------------------------
+
+bot.on("message:photo", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  if (ctx.from) setOwner({ chatId, username: ctx.from.username ?? null, firstName: ctx.from.first_name ?? null });
+
+  await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+
+  const best = ctx.message.photo[ctx.message.photo.length - 1];
+  if (!best) return;
+
+  let fileUrl: string;
+  try {
+    fileUrl = await resolveFileUrl(best.file_id);
+  } catch (err) {
+    console.error("[telegram] failed to resolve photo file_id", err);
+    await ctx.reply("⚠️ Couldn't get file URL from Telegram. Try again.");
+    return;
+  }
+
+  recordIncoming({
+    chatId,
+    userId: ctx.from?.id ?? null,
+    username: ctx.from?.username ?? null,
+    text: ctx.message.caption ?? "",
+    fileUrl,
+    fileType: "photo",
+    fileName: `photo_${best.file_unique_id}.jpg`,
+  });
+
+  await ctx.reply("📥 Got your photo! Now go to Claude and say what it is — I'll process it.");
+});
+
+bot.on("message:video", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  if (ctx.from) setOwner({ chatId, username: ctx.from.username ?? null, firstName: ctx.from.first_name ?? null });
+
+  await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+
+  const video = ctx.message.video;
+  let fileUrl: string;
+  try {
+    fileUrl = await resolveFileUrl(video.file_id);
+  } catch (err) {
+    console.error("[telegram] failed to resolve video file_id", err);
+    await ctx.reply("⚠️ Couldn't get file URL from Telegram. Try again.");
+    return;
+  }
+
+  const ext = video.mime_type === "video/quicktime" ? "mov" : "mp4";
+  recordIncoming({
+    chatId,
+    userId: ctx.from?.id ?? null,
+    username: ctx.from?.username ?? null,
+    text: ctx.message.caption ?? "",
+    fileUrl,
+    fileType: "video",
+    fileName: `video_${video.file_unique_id}.${ext}`,
+  });
+
+  await ctx.reply("📥 Got your video! Now go to Claude and say what it is — I'll process it.");
+});
+
+bot.on("message:document", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  if (ctx.from) setOwner({ chatId, username: ctx.from.username ?? null, firstName: ctx.from.first_name ?? null });
+
+  const doc = ctx.message.document;
+  const isMedia = doc.mime_type?.startsWith("image/") || doc.mime_type?.startsWith("video/");
+  if (!isMedia) {
+    await ctx.reply("I can only process photo/video files for the social post generator.");
+    return;
+  }
+
+  await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+
+  let fileUrl: string;
+  try {
+    fileUrl = await resolveFileUrl(doc.file_id);
+  } catch (err) {
+    console.error("[telegram] failed to resolve document file_id", err);
+    await ctx.reply("⚠️ Couldn't get file URL from Telegram. Try again.");
+    return;
+  }
+
+  recordIncoming({
+    chatId,
+    userId: ctx.from?.id ?? null,
+    username: ctx.from?.username ?? null,
+    text: ctx.message.caption ?? "",
+    fileUrl,
+    fileType: doc.mime_type?.startsWith("video/") ? "video" : "photo",
+    fileName: doc.file_name ?? `file_${doc.file_unique_id}`,
+  });
+
+  await ctx.reply("📥 Got your file! Now go to Claude and say what it is — I'll process it.");
+});
+
+// ---------------------------------------------------------------------------
+// Text handler
+// ---------------------------------------------------------------------------
 
 // Catch-all for text messages (commands are handled above).
 bot.on("message:text", async (ctx: Context) => {
