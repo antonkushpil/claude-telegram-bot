@@ -421,7 +421,7 @@ bot.command("whoami", async (ctx) => {
 });
 
 bot.command("version", async (ctx) => {
-  await ctx.reply("v1.3.0 — Railway-side processing, persistent memory, inline buttons");
+  await ctx.reply("v1.4.0 — multi-user support, persistent name + daily greeting");
 });
 
 // ---------------------------------------------------------------------------
