@@ -129,6 +129,10 @@ bot.command("whoami", async (ctx) => {
   );
 });
 
+bot.command("version", async (ctx) => {
+  await ctx.reply("v1.1.0 — photo/video support + download_file MCP tool");
+});
+
 // ---------------------------------------------------------------------------
 // Media handlers — photo, video, document
 // ---------------------------------------------------------------------------
