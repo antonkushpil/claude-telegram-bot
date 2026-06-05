@@ -274,6 +274,7 @@ export interface PostDraft {
   selectedPlatform?: string;      // 'tiktok' | 'instagram' | 'reddit'
   selectedCategory?: string;
   previousDescriptions: string[]; // shown so far — never repeat
+  cleanFileId?: string;           // Telegram file_id of the stripped photo for forwarding
 }
 
 const upsertDraft = db.prepare(`
@@ -355,14 +356,27 @@ export function getUser(chatId: number): UserRecord | null {
   };
 }
 
-/** Ensure user row exists. Returns the record. */
-export function ensureUser(chatId: number): UserRecord {
+/**
+ * Ensure user row exists. If the row is new and `telegramName` is provided,
+ * it is used automatically — no need to ask. Only sets pendingAction =
+ * 'awaiting_name' when there is genuinely no name available at all.
+ */
+export function ensureUser(chatId: number, telegramName?: string | null): UserRecord {
   const existing = getUser(chatId);
-  if (existing) return existing;
+  if (existing) {
+    // If we now have a Telegram name but the record has none, fill it in silently.
+    if (!existing.name && telegramName?.trim()) {
+      setUserName(chatId, telegramName.trim());
+      return getUser(chatId)!;
+    }
+    return existing;
+  }
+
+  const name = telegramName?.trim() || null;
   upsertUser.run({
     chatId,
-    name: null,
-    pendingAction: "awaiting_name",
+    name,
+    pendingAction: name ? null : "awaiting_name",
     lastGreetedDate: null,
     createdAt: Math.floor(Date.now() / 1000),
   });
@@ -387,4 +401,27 @@ export function shouldGreetToday(user: UserRecord): boolean {
   if (!user.name) return false;
   const today = new Date().toISOString().slice(0, 10);
   return user.lastGreetedDate !== today;
+}
+
+// ---------------------------------------------------------------------------
+// Contact lookup (find another user's chat_id by name)
+// ---------------------------------------------------------------------------
+
+const selectUserByName = db.prepare(`
+  SELECT chat_id, name, pending_action, last_greeted_date
+  FROM users
+  WHERE lower(name) = lower(?)
+  LIMIT 1
+`) as Database.Statement<[string], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null }>;
+
+/** Find a user by their stored name (case-insensitive). Returns null if not found. */
+export function getUserByName(name: string): UserRecord | null {
+  const row = selectUserByName.get(name.trim());
+  if (!row) return null;
+  return {
+    chatId: row.chat_id,
+    name: row.name,
+    pendingAction: row.pending_action,
+    lastGreetedDate: row.last_greeted_date,
+  };
 }

@@ -38,6 +38,7 @@ import {
   setUserName,
   markGreetedToday,
   shouldGreetToday,
+  getUserByName,
   type PostDraft,
 } from "./db.js";
 
@@ -92,7 +93,7 @@ async function generateContextCategories(
           },
           {
             type: "text",
-            text: `Context: "${userContext}"\n\nLook at this photo and suggest exactly 4 short category labels (1-2 words each) that would make good social media post angles — based on what you actually see (location, mood, style, activity, etc.). Do NOT suggest: Sexy, Flirting, Emotions, Casual, Elegant, Erotic — those are already covered.\n\nRespond ONLY with a JSON array of 4 strings, e.g. ["Travel", "Night Out", "Foodie", "Power Look"]`,
+            text: `Context: "${userContext}"\n\nLook at this photo and suggest exactly 4 short category labels (1-2 words each) for social media post angles — based ONLY on the surroundings: location, setting, lighting, atmosphere, objects, food, decor, time of day. Do NOT reference the person. Do NOT suggest: Sexy, Flirting, Emotions, Casual, Elegant, Erotic — those are already covered.\n\nRespond ONLY with a JSON array of 4 strings, e.g. ["Night Out", "Italian Vibes", "Candlelight", "City Life"]`,
           },
         ],
       },
@@ -163,7 +164,7 @@ async function generateDescription(
           },
           {
             type: "text",
-            text: `You are writing a ${platformLabel} post caption.\n\nPhoto context: "${userContext}"\nCategory/vibe: "${category}"\n\n${trendGuide}${avoidBlock}\n\nAnalyze the photo carefully — the person's expression, outfit, setting, lighting, mood — then write ONE caption that:\n- Fits the "${category}" vibe authentically\n- Follows current ${platformLabel} trends above\n- Feels human and natural, not AI-generated\n- Is genuinely different from any previous suggestions\n\nReturn ONLY the caption text. No explanations, no quotes around it.`,
+            text: `You are writing a ${platformLabel} post caption.\n\nPhoto context: "${userContext}"\nCategory/vibe: "${category}"\n\n${trendGuide}${avoidBlock}\n\nFocus ONLY on the surroundings — the location, setting, lighting, colors, atmosphere, time of day, interior/exterior design, food, objects, background details. Do NOT describe or reference the person's body, appearance, or clothing.\n\nWrite ONE caption that:\n- Draws from the environment and mood of the scene\n- Fits the "${category}" vibe authentically\n- Follows current ${platformLabel} trends above\n- Feels human and natural, not AI-generated\n- Is genuinely different from any previous suggestions\n\nReturn ONLY the caption text. No explanations, no quotes around it.`,
           },
         ],
       },
@@ -217,12 +218,12 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
   writeFileSync(destPath, Buffer.from(buf));
 }
 
-/** Send a clean photo to Telegram. Deletes the file after upload. */
+/** Send a clean photo to Telegram. Deletes the file after upload. Returns Telegram file_id. */
 async function uploadAndDeletePhoto(
   chatId: number,
   filePath: string,
   caption: string,
-): Promise<void> {
+): Promise<string | undefined> {
   const form = new FormData();
   form.append("chat_id", String(chatId));
   const blob = new Blob([readFileSync(filePath)], { type: "image/jpeg" });
@@ -233,9 +234,15 @@ async function uploadAndDeletePhoto(
     method: "POST",
     body: form,
   });
-  const data = (await res.json()) as { ok: boolean; description?: string };
+  const data = (await res.json()) as {
+    ok: boolean;
+    description?: string;
+    result?: { photo?: Array<{ file_id: string }> };
+  };
   safeUnlink(filePath);
   if (!data.ok) throw new Error(`sendPhoto failed: ${data.description}`);
+  // Return the largest photo's file_id for later forwarding
+  return data.result?.photo?.at(-1)?.file_id;
 }
 
 /** Send a clean video/document to Telegram. Deletes the file after upload. */
@@ -335,14 +342,14 @@ async function processMedia(
     } else {
       // Read for Claude BEFORE deleting
       const imageBase64 = readFileSync(outPath).toString("base64");
-      await uploadAndDeletePhoto(chatId, outPath, cleanCaption); // outPath deleted inside
+      const cleanFileId = await uploadAndDeletePhoto(chatId, outPath, cleanCaption); // outPath deleted inside
 
       // 5. Generate categories: 6 mandatory + 4 from photo context
       await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
       const contextCats = await generateContextCategories(userContext, imageBase64);
       const categories = [...MANDATORY_CATEGORIES, ...contextCats]; // 10 total
 
-      const draft: PostDraft = { userContext, imageBase64, categories, previousDescriptions: [] };
+      const draft: PostDraft = { userContext, imageBase64, categories, previousDescriptions: [], cleanFileId };
       saveDraft(chatId, draft);
 
       await ctx.api.sendMessage(chatId, "Choose a platform:", {
@@ -370,6 +377,53 @@ async function processMedia(
 // Text helper
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Send-to-contact helpers
+// ---------------------------------------------------------------------------
+
+// Matches: "send this to Mary", "send photo to Mary", "send it to Mary", etc.
+const SEND_TO_REGEX = /send\s+(this|it|version|caption|description|photo|pic|image)\s+to\s+(\w+)/i;
+
+async function handleSendTo(
+  senderChatId: number,
+  what: string,
+  targetName: string,
+): Promise<string> {
+  const contact = getUserByName(targetName);
+  if (!contact) {
+    return `❌ I don't know "${targetName}" — they need to have messaged this bot at least once so I can save their chat ID.`;
+  }
+
+  const isPhoto = /photo|pic|image/.test(what.toLowerCase());
+  const draft = loadDraft(senderChatId);
+
+  if (isPhoto) {
+    if (!draft?.cleanFileId) {
+      return "❌ No clean photo found in the current session. Send a photo first.";
+    }
+    try {
+      await bot.api.sendPhoto(contact.chatId, draft.cleanFileId, {
+        caption: "📸 Sent via bot",
+      });
+      return `✅ Clean photo sent to ${contact.name}.`;
+    } catch (err) {
+      return `❌ Failed to send photo to ${contact.name}: ${String(err)}`;
+    }
+  } else {
+    // Send last generated description
+    const lastDesc = draft?.previousDescriptions?.at(-1);
+    if (!lastDesc) {
+      return "❌ No description to send yet. Generate a post caption first.";
+    }
+    try {
+      await bot.api.sendMessage(contact.chatId, lastDesc);
+      return `✅ Caption sent to ${contact.name}.`;
+    } catch (err) {
+      return `❌ Failed to send to ${contact.name}: ${String(err)}`;
+    }
+  }
+}
+
 export function splitForTelegram(text: string, limit = TELEGRAM_MAX_MSG): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
@@ -386,14 +440,23 @@ export function splitForTelegram(text: string, limit = TELEGRAM_MAX_MSG): string
 }
 
 async function askClaude(chatId: number, userText: string): Promise<string> {
+  // Load history BEFORE appending the new turn so it reflects prior exchanges
   const history = getHistory(chatId);
   appendTurn(chatId, "user", userText);
+
+  // history already contains previous turns; append current user message for the API call
+  const messages: Array<{ role: "user" | "assistant"; content: string }> = [
+    ...history,
+    { role: "user", content: userText },
+  ];
+
+  console.log(`[claude] chat=${chatId} history_turns=${history.length} sending ${messages.length} messages`);
 
   const response = await anthropic.messages.create({
     model: config.claudeModel,
     max_tokens: config.maxTokens,
     system: config.systemPrompt,
-    messages: [...history, { role: "user", content: userText }],
+    messages,
   });
 
   const reply = response.content
@@ -419,7 +482,7 @@ bot.command(["start", "help"], async (ctx) => {
   if (!chatId) return;
   if (u) setOwner({ chatId, username: u.username ?? null, firstName: u.first_name ?? null });
 
-  const user = ensureUser(chatId);
+  const user = ensureUser(chatId, u?.first_name);
   if (user.pendingAction === "awaiting_name") {
     await ctx.reply("Hi! 👋 I'm a Claude-powered bot. What's your name?");
     return;
@@ -468,7 +531,7 @@ bot.on("message:photo", async (ctx) => {
   if (!chatId) return;
   if (ctx.from) setOwner({ chatId, username: ctx.from.username ?? null, firstName: ctx.from.first_name ?? null });
 
-  const user = ensureUser(chatId);
+  const user = ensureUser(chatId, ctx.from?.first_name);
   if (user.pendingAction === "awaiting_name") {
     await ctx.reply("Before we start — what's your name? 😊");
     return;
@@ -495,7 +558,7 @@ bot.on("message:video", async (ctx) => {
   if (!chatId) return;
   if (ctx.from) setOwner({ chatId, username: ctx.from.username ?? null, firstName: ctx.from.first_name ?? null });
 
-  const user = ensureUser(chatId);
+  const user = ensureUser(chatId, ctx.from?.first_name);
   if (user.pendingAction === "awaiting_name") {
     await ctx.reply("Before we start — what's your name? 😊");
     return;
@@ -637,7 +700,7 @@ bot.on("message:text", async (ctx: Context) => {
   if (ctx.from) setOwner({ chatId, username: ctx.from.username ?? null, firstName: ctx.from.first_name ?? null });
 
   // --- Multi-user: ensure user record exists ---
-  const user = ensureUser(chatId);
+  const user = ensureUser(chatId, ctx.from?.first_name);
 
   // --- Awaiting name: treat this message as the user's name ---
   if (user.pendingAction === "awaiting_name") {
@@ -653,6 +716,16 @@ bot.on("message:text", async (ctx: Context) => {
   }
 
   recordIncoming({ chatId, userId: ctx.from?.id ?? null, username: ctx.from?.username ?? null, text });
+
+  // --- Send-to-contact shortcut ---
+  const sendMatch = text.match(SEND_TO_REGEX);
+  if (sendMatch) {
+    const what = sendMatch[1]!;
+    const targetName = sendMatch[2]!;
+    const result = await handleSendTo(chatId, what, targetName);
+    await ctx.reply(result);
+    return;
+  }
 
   // --- Daily greeting: first message of the day ---
   if (shouldGreetToday(user)) {
