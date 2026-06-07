@@ -442,11 +442,16 @@ const updateAutoForward = db.prepare(
 const selectAllUsers = db.prepare(`
   SELECT chat_id, name, pending_action, last_greeted_date, auto_forward_chat_id
   FROM users
-  WHERE name IS NOT NULL
   ORDER BY name ASC
 `) as Database.Statement<[], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null; auto_forward_chat_id: number | null }>;
 
+const countAllUsers = db.prepare(
+  "SELECT COUNT(*) as cnt FROM users",
+) as Database.Statement<[], { cnt: number }>;
+
 export function getAllUsers(): UserRecord[] {
+  const total = countAllUsers.get()?.cnt ?? 0;
+  console.log(`[db] getAllUsers: total rows in users table = ${total}`);
   return selectAllUsers.all().map((r) => ({
     chatId: r.chat_id,
     name: r.name,

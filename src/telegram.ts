@@ -579,10 +579,17 @@ bot.command("mary", async (ctx) => {
 bot.command("users", async (ctx) => {
   const users = getAllUsers();
   if (users.length === 0) {
-    await ctx.reply("No users in the database yet. Users appear here once they message the bot.");
+    await ctx.reply(
+      "No users in the database yet.\n\n" +
+      "Note: the DB resets on each Railway deploy unless you have a /data volume mounted. " +
+      "Users are recorded as they interact with the bot.",
+    );
     return;
   }
-  const lines = users.map((u, i) => `${i + 1}. ${u.name} (chat_id: ${u.chatId})`);
+  const lines = users.map((u, i) => {
+    const name = u.name ?? "(no name)";
+    return `${i + 1}. ${name}  —  chat_id: ${u.chatId}`;
+  });
   await ctx.reply(`👥 Known users (${users.length}):\n\n${lines.join("\n")}`);
 });
 
