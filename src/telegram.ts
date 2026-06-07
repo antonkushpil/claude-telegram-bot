@@ -242,12 +242,15 @@ async function uploadAndDeletePhoto(
   const data = (await res.json()) as {
     ok: boolean;
     description?: string;
-    result?: { photo?: Array<{ file_id: string }> };
+    result?: { photo?: Array<{ file_id: string; file_unique_id: string }> };
   };
-  safeUnlink(filePath);
+  safeUnlink(filePath); // delete local file regardless of outcome
+
   if (!data.ok) throw new Error(`sendPhoto failed: ${data.description}`);
-  // Return the largest photo's file_id for later forwarding
-  return data.result?.photo?.at(-1)?.file_id;
+
+  const fileId = data.result?.photo?.at(-1)?.file_id;
+  console.log(`[upload] sendPhoto ok, file_id=${fileId ?? "MISSING"}`);
+  return fileId;
 }
 
 /** Send a clean video/document to Telegram. Deletes the file after upload. */
@@ -351,10 +354,15 @@ async function processMedia(
 
       // Auto-forward clean photo to Mary if enabled
       const autoFwdTarget = getAutoForwardChatId(chatId);
-      if (autoFwdTarget && cleanFileId) {
-        await bot.api.sendPhoto(autoFwdTarget, cleanFileId, {
-          caption: "📸 Clean photo (metadata stripped)",
-        }).catch((err) => console.error("[auto-forward] failed:", err));
+      console.log(`[auto-forward] target=${autoFwdTarget ?? "none"} fileId=${cleanFileId ?? "none"}`);
+      if (autoFwdTarget) {
+        if (cleanFileId) {
+          await bot.api.sendPhoto(autoFwdTarget, cleanFileId, {
+            caption: "📸 Clean photo (metadata stripped)",
+          }).catch((err) => console.error("[auto-forward] sendPhoto failed:", err));
+        } else {
+          console.error("[auto-forward] skipped — cleanFileId is undefined");
+        }
       }
 
       // 5. Generate categories: 6 mandatory + 4 from photo context
@@ -575,7 +583,7 @@ bot.command("users", async (ctx) => {
     return;
   }
   const lines = users.map((u, i) => `${i + 1}. ${u.name} (chat_id: ${u.chatId})`);
-  await ctx.reply(`👥 *Known users (${users.length}):*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
+  await ctx.reply(`👥 Known users (${users.length}):\n\n${lines.join("\n")}`);
 });
 
 // /msg UserName Hello there! → sends "Hello there!" to UserName's chat
