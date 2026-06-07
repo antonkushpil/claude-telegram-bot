@@ -72,19 +72,21 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS users (
-    chat_id            INTEGER PRIMARY KEY,
-    name               TEXT,                -- null until user provides it
-    pending_action     TEXT,                -- e.g. 'awaiting_name'
-    last_greeted_date  TEXT,                -- 'YYYY-MM-DD' in UTC
-    created_at         INTEGER NOT NULL
+    chat_id              INTEGER PRIMARY KEY,
+    name                 TEXT,                -- null until user provides it
+    pending_action       TEXT,                -- e.g. 'awaiting_name'
+    last_greeted_date    TEXT,                -- 'YYYY-MM-DD' in UTC
+    auto_forward_chat_id INTEGER,             -- if set, clean photos are auto-forwarded here
+    created_at           INTEGER NOT NULL
   );
 `);
 
-// Migrate existing databases that pre-date the media columns.
+// Migrate existing databases that pre-date added columns.
 for (const col of [
   "ALTER TABLE recent_messages ADD COLUMN file_url  TEXT",
   "ALTER TABLE recent_messages ADD COLUMN file_type TEXT",
   "ALTER TABLE recent_messages ADD COLUMN file_name TEXT",
+  "ALTER TABLE users ADD COLUMN auto_forward_chat_id INTEGER",
 ]) {
   try { db.exec(col); } catch { /* column already exists */ }
 }
@@ -318,11 +320,12 @@ export interface UserRecord {
   name: string | null;
   pendingAction: string | null;
   lastGreetedDate: string | null;
+  autoForwardChatId: number | null;
 }
 
 const upsertUser = db.prepare(`
-  INSERT INTO users (chat_id, name, pending_action, last_greeted_date, created_at)
-  VALUES (@chatId, @name, @pendingAction, @lastGreetedDate, @createdAt)
+  INSERT INTO users (chat_id, name, pending_action, last_greeted_date, auto_forward_chat_id, created_at)
+  VALUES (@chatId, @name, @pendingAction, @lastGreetedDate, @autoForwardChatId, @createdAt)
   ON CONFLICT(chat_id) DO UPDATE SET
     name              = COALESCE(excluded.name, users.name),
     pending_action    = excluded.pending_action,
@@ -330,8 +333,8 @@ const upsertUser = db.prepare(`
 `);
 
 const selectUser = db.prepare(
-  "SELECT chat_id, name, pending_action, last_greeted_date FROM users WHERE chat_id = ?",
-) as Database.Statement<[number], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null }>;
+  "SELECT chat_id, name, pending_action, last_greeted_date, auto_forward_chat_id FROM users WHERE chat_id = ?",
+) as Database.Statement<[number], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null; auto_forward_chat_id: number | null }>;
 
 const updateUserName = db.prepare(
   "UPDATE users SET name = @name, pending_action = NULL WHERE chat_id = @chatId",
@@ -353,6 +356,7 @@ export function getUser(chatId: number): UserRecord | null {
     name: row.name,
     pendingAction: row.pending_action,
     lastGreetedDate: row.last_greeted_date,
+    autoForwardChatId: row.auto_forward_chat_id ?? null,
   };
 }
 
@@ -364,7 +368,6 @@ export function getUser(chatId: number): UserRecord | null {
 export function ensureUser(chatId: number, telegramName?: string | null): UserRecord {
   const existing = getUser(chatId);
   if (existing) {
-    // If we now have a Telegram name but the record has none, fill it in silently.
     if (!existing.name && telegramName?.trim()) {
       setUserName(chatId, telegramName.trim());
       return getUser(chatId)!;
@@ -378,6 +381,7 @@ export function ensureUser(chatId: number, telegramName?: string | null): UserRe
     name,
     pendingAction: name ? null : "awaiting_name",
     lastGreetedDate: null,
+    autoForwardChatId: null,
     createdAt: Math.floor(Date.now() / 1000),
   });
   return getUser(chatId)!;
@@ -408,11 +412,11 @@ export function shouldGreetToday(user: UserRecord): boolean {
 // ---------------------------------------------------------------------------
 
 const selectUserByName = db.prepare(`
-  SELECT chat_id, name, pending_action, last_greeted_date
+  SELECT chat_id, name, pending_action, last_greeted_date, auto_forward_chat_id
   FROM users
   WHERE lower(name) = lower(?)
   LIMIT 1
-`) as Database.Statement<[string], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null }>;
+`) as Database.Statement<[string], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null; auto_forward_chat_id: number | null }>;
 
 /** Find a user by their stored name (case-insensitive). Returns null if not found. */
 export function getUserByName(name: string): UserRecord | null {
@@ -423,5 +427,40 @@ export function getUserByName(name: string): UserRecord | null {
     name: row.name,
     pendingAction: row.pending_action,
     lastGreetedDate: row.last_greeted_date,
+    autoForwardChatId: row.auto_forward_chat_id ?? null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Auto-forward setting
+// ---------------------------------------------------------------------------
+
+const updateAutoForward = db.prepare(
+  "UPDATE users SET auto_forward_chat_id = ? WHERE chat_id = ?",
+);
+
+const selectAllUsers = db.prepare(`
+  SELECT chat_id, name, pending_action, last_greeted_date, auto_forward_chat_id
+  FROM users
+  WHERE name IS NOT NULL
+  ORDER BY name ASC
+`) as Database.Statement<[], { chat_id: number; name: string | null; pending_action: string | null; last_greeted_date: string | null; auto_forward_chat_id: number | null }>;
+
+export function getAllUsers(): UserRecord[] {
+  return selectAllUsers.all().map((r) => ({
+    chatId: r.chat_id,
+    name: r.name,
+    pendingAction: r.pending_action,
+    lastGreetedDate: r.last_greeted_date,
+    autoForwardChatId: r.auto_forward_chat_id ?? null,
+  }));
+}
+
+/** Enable auto-forward for chatId → send clean photos to targetChatId after processing. */
+export function setAutoForward(chatId: number, targetChatId: number | null): void {
+  updateAutoForward.run(targetChatId, chatId);
+}
+
+export function getAutoForwardChatId(chatId: number): number | null {
+  return getUser(chatId)?.autoForwardChatId ?? null;
 }

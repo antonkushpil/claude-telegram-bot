@@ -39,8 +39,13 @@ import {
   markGreetedToday,
   shouldGreetToday,
   getUserByName,
+  getAllUsers,
+  setAutoForward,
+  getAutoForwardChatId,
   type PostDraft,
 } from "./db.js";
+
+const MARY_CHAT_ID = 8898794877;
 
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
@@ -344,6 +349,14 @@ async function processMedia(
       const imageBase64 = readFileSync(outPath).toString("base64");
       const cleanFileId = await uploadAndDeletePhoto(chatId, outPath, cleanCaption); // outPath deleted inside
 
+      // Auto-forward clean photo to Mary if enabled
+      const autoFwdTarget = getAutoForwardChatId(chatId);
+      if (autoFwdTarget && cleanFileId) {
+        await bot.api.sendPhoto(autoFwdTarget, cleanFileId, {
+          caption: "📸 Clean photo (metadata stripped)",
+        }).catch((err) => console.error("[auto-forward] failed:", err));
+      }
+
       // 5. Generate categories: 6 mandatory + 4 from photo context
       await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
       const contextCats = await generateContextCategories(userContext, imageBase64);
@@ -391,7 +404,7 @@ async function handleSendTo(
 ): Promise<string> {
   const contact = getUserByName(targetName);
   if (!contact) {
-    return `❌ I don't know "${targetName}" — they need to have messaged this bot at least once so I can save their chat ID.`;
+    return `❌ I don't know "${targetName}" — they need to have messaged this bot at least once.\nUse /users to see everyone I know.`;
   }
 
   const isPhoto = /photo|pic|image/.test(what.toLowerCase());
@@ -399,21 +412,18 @@ async function handleSendTo(
 
   if (isPhoto) {
     if (!draft?.cleanFileId) {
-      return "❌ No clean photo found in the current session. Send a photo first.";
+      return "❌ No clean photo in the current session. Send a photo first.";
     }
     try {
-      await bot.api.sendPhoto(contact.chatId, draft.cleanFileId, {
-        caption: "📸 Sent via bot",
-      });
+      await bot.api.sendPhoto(contact.chatId, draft.cleanFileId, { caption: "📸 Sent via bot" });
       return `✅ Clean photo sent to ${contact.name}.`;
     } catch (err) {
       return `❌ Failed to send photo to ${contact.name}: ${String(err)}`;
     }
   } else {
-    // Send last generated description
     const lastDesc = draft?.previousDescriptions?.at(-1);
     if (!lastDesc) {
-      return "❌ No description to send yet. Generate a post caption first.";
+      return "❌ No caption to send yet. Generate one first.";
     }
     try {
       await bot.api.sendMessage(contact.chatId, lastDesc);
@@ -421,6 +431,19 @@ async function handleSendTo(
     } catch (err) {
       return `❌ Failed to send to ${contact.name}: ${String(err)}`;
     }
+  }
+}
+
+async function sendMessageToContact(targetName: string, text: string): Promise<string> {
+  const contact = getUserByName(targetName);
+  if (!contact) {
+    return `❌ I don't know "${targetName}".\nUse /users to see everyone I know.`;
+  }
+  try {
+    await bot.api.sendMessage(contact.chatId, text);
+    return `✅ Message sent to ${contact.name}.`;
+  } catch (err) {
+    return `❌ Failed to send to ${contact.name}: ${String(err)}`;
   }
 }
 
@@ -497,6 +520,9 @@ bot.command(["start", "help"], async (ctx) => {
       "  3. Generate TikTok, Instagram & Reddit copy\n\n" +
       "Commands:\n" +
       "/reset — clear conversation history\n" +
+      "/users — list all known users\n" +
+      "/msg Name Text — send a message to someone\n" +
+      "/mary on|off — auto-forward clean photos to Mary\n" +
       "/model — show active Claude model\n" +
       "/whoami — show your chat_id",
   );
@@ -519,7 +545,56 @@ bot.command("whoami", async (ctx) => {
 });
 
 bot.command("version", async (ctx) => {
-  await ctx.reply("v1.4.0 — multi-user support, persistent name + daily greeting");
+  await ctx.reply("v1.6.0 — /users list, /msg, auto-forward to Mary");
+});
+
+bot.command("mary", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const arg = ctx.match?.trim().toLowerCase(); // "on" or "off"
+  if (arg === "on") {
+    setAutoForward(chatId, MARY_CHAT_ID);
+    await ctx.reply("✅ Auto-forward to Mary enabled — every clean photo will be sent to her automatically.");
+  } else if (arg === "off") {
+    setAutoForward(chatId, null);
+    await ctx.reply("🚫 Auto-forward to Mary disabled.");
+  } else {
+    const current = getAutoForwardChatId(chatId);
+    const status = current ? "✅ enabled" : "🚫 disabled";
+    await ctx.reply(
+      `Auto-forward to Mary is currently ${status}.\n\nUse:\n/mary on — enable\n/mary off — disable`,
+    );
+  }
+});
+
+bot.command("users", async (ctx) => {
+  const users = getAllUsers();
+  if (users.length === 0) {
+    await ctx.reply("No users in the database yet. Users appear here once they message the bot.");
+    return;
+  }
+  const lines = users.map((u, i) => `${i + 1}. ${u.name} (chat_id: ${u.chatId})`);
+  await ctx.reply(`👥 *Known users (${users.length}):*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
+});
+
+// /msg UserName Hello there! → sends "Hello there!" to UserName's chat
+bot.command("msg", async (ctx) => {
+  const args = ctx.match?.trim() ?? "";
+  // First word is the name, rest is the message
+  const spaceIdx = args.indexOf(" ");
+  if (spaceIdx === -1) {
+    await ctx.reply("Usage: /msg Name Your message here\n\nExample: /msg Mary Hey, check this out!");
+    return;
+  }
+  const targetName = args.slice(0, spaceIdx).trim();
+  const text = args.slice(spaceIdx + 1).trim();
+  if (!text) {
+    await ctx.reply("Message can't be empty.\n\nUsage: /msg Mary Your message here");
+    return;
+  }
+  const result = await sendMessageToContact(targetName, text);
+  await ctx.reply(result);
 });
 
 // ---------------------------------------------------------------------------
